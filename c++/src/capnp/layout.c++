@@ -698,6 +698,10 @@ struct WireHelpers {
     // mistakenly thinks the source location still owns the object.  transferPointer() doesn't do
     // this zeroing itself because many callers transfer several pointers in a loop then zero out
     // the whole section.
+
+    KJ_DASSERT(dst->isNull());
+    // We expect the caller to ensure the target is already null so won't leak.
+
     if (src->isNull()) {
       memset(dst, 0, sizeof(WirePointer));
     } else if (src->kind() == WirePointer::FAR) {
@@ -2034,6 +2038,45 @@ OrphanBuilder StructBuilder::disown(WirePointerCount ptrIndex) {
   return WireHelpers::disown(segment, pointers + ptrIndex);
 }
 
+void StructBuilder::transferContentFrom(StructBuilder other) {
+  // Determine the amount of data the builders have in common.
+  BitCount sharedDataSize = kj::min(dataSize, other.dataSize);
+
+  if (dataSize > sharedDataSize) {
+    // Since the target is larger than the source, make sure to zero out the extra bits that the
+    // source doesn't have.
+    if (dataSize == 1 * BITS) {
+      setDataField<bool>(0 * ELEMENTS, false);
+    } else {
+      byte* unshared = reinterpret_cast<byte*>(data) + sharedDataSize / BITS_PER_BYTE / BYTES;
+      memset(unshared, 0, (dataSize - sharedDataSize) / BITS_PER_BYTE / BYTES);
+    }
+  }
+
+  // Copy over the shared part.
+  if (sharedDataSize == 1 * BITS) {
+    setDataField<bool>(0 * ELEMENTS, other.getDataField<bool>(0 * ELEMENTS));
+  } else {
+    memcpy(data, other.data, sharedDataSize / BITS_PER_BYTE / BYTES);
+  }
+
+  // Zero out all pointers in the target.
+  for (uint i = 0; i < pointerCount / POINTERS; i++) {
+    WireHelpers::zeroObject(segment, pointers + i);
+  }
+
+  // Transfer the pointers.
+  WirePointerCount sharedPointerCount = kj::min(pointerCount, other.pointerCount);
+  for (uint i = 0; i < sharedPointerCount / POINTERS; i++) {
+    WireHelpers::transferPointer(segment, pointers + i, other.segment, other.pointers + i);
+  }
+
+  // Zero out the pointers that were transferred in the source because it no longer has ownership.
+  // If the source had any extra pointers that the destination didn't have space for, we
+  // intentionally leave them be, so that they'll be cleaned up later.
+  memset(other.pointers, 0, sharedPointerCount * BYTES_PER_POINTER / BYTES);
+}
+
 bool StructBuilder::isPointerFieldNull(WirePointerCount ptrIndex) {
   return (pointers + ptrIndex)->isNull();
 }
@@ -2402,7 +2445,7 @@ OrphanBuilder OrphanBuilder::initStructList(
         result.tagAsPtr(), result.segment, elementCount, elementSize);
     KJ_ASSERT(builder.segment == result.segment,
               "Orphan was unexpectedly allocated in a different segment.");
-    result.location = reinterpret_cast<word*>(builder.ptr);
+    result.location = reinterpret_cast<word*>(builder.ptr) - POINTER_SIZE_IN_WORDS;
     return result;
   }
 }
@@ -2520,7 +2563,7 @@ ListBuilder OrphanBuilder::asStructList(StructSize elementSize) {
   if (tagAsPtr()->kind() == WirePointer::FAR) {
     location = nullptr;
   } else {
-    location = reinterpret_cast<word*>(result.ptr);
+    location = reinterpret_cast<word*>(result.ptr) - POINTER_SIZE_IN_WORDS;
   }
 
   return result;
@@ -2549,7 +2592,11 @@ ObjectBuilder OrphanBuilder::asObject() {
         location = reinterpret_cast<word*>(result.structBuilder.data);
         break;
       case ObjectKind::LIST:
-        location = reinterpret_cast<word*>(result.listBuilder.ptr);
+        if (tagAsPtr()->listRef.elementSize() == FieldSize::INLINE_COMPOSITE) {
+          location = reinterpret_cast<word*>(result.listBuilder.ptr) - POINTER_SIZE_IN_WORDS;
+        } else {
+          location = reinterpret_cast<word*>(result.listBuilder.ptr);
+        }
         break;
       case ObjectKind::NULL_POINTER:
         location = nullptr;

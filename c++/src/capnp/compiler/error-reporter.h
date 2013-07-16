@@ -21,34 +21,26 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include "string.h"
-#include <gtest/gtest.h>
-#include <string>
+#ifndef ERROR_REPORTER_H_
+#define ERROR_REPORTER_H_
 
-namespace kj {
-namespace _ {  // private
-namespace {
+#include "../common.h"
+#include <kj/string.h>
 
-TEST(String, Str) {
-  EXPECT_EQ("foobar", str("foo", "bar"));
-  EXPECT_EQ("1 2 3 4", str(1, " ", 2u, " ", 3l, " ", 4ll));
-  EXPECT_EQ("1.5 foo 1e15 bar -3", str(1.5f, " foo ", 1e15, " bar ", -3));
-  EXPECT_EQ("foo", str('f', 'o', 'o'));
-}
+namespace capnp {
+namespace compiler {
 
-TEST(String, StartsEndsWith) {
-  EXPECT_TRUE(StringPtr("foobar").startsWith("foo"));
-  EXPECT_FALSE(StringPtr("foobar").startsWith("bar"));
-  EXPECT_FALSE(StringPtr("foobar").endsWith("foo"));
-  EXPECT_TRUE(StringPtr("foobar").endsWith("bar"));
+class ErrorReporter {
+public:
+  virtual ~ErrorReporter() noexcept(false);
 
-  EXPECT_FALSE(StringPtr("fo").startsWith("foo"));
-  EXPECT_FALSE(StringPtr("fo").endsWith("foo"));
+  virtual void addError(uint32_t startByte, uint32_t endByte, kj::String message) = 0;
+  // Report an error at the given location in the input text.  `startByte` and `endByte` indicate
+  // the span of text that is erroneous.  They may be equal, in which case the parser was only
+  // able to identify where the error begins, not where it ends.
+};
 
-  EXPECT_TRUE(StringPtr("foobar").startsWith(""));
-  EXPECT_TRUE(StringPtr("foobar").endsWith(""));
-}
+}  // namespace compiler
+}  // namespace capnp
 
-}  // namespace
-}  // namespace _ (private)
-}  // namespace kj
+#endif  // ERROR_REPORTER_H_
