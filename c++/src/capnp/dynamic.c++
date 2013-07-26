@@ -1408,7 +1408,7 @@ typeName DynamicValue::Reader::AsImpl<typeName>::apply(const Reader& reader) { \
     case FLOAT: \
       return ifFloat<typeName>(reader.floatValue); \
     default: \
-      KJ_FAIL_REQUIRE("Type mismatch when using DynamicValue::Reader::as().") { \
+      KJ_FAIL_REQUIRE("Value type mismatch.") { \
         return 0; \
       } \
   } \
@@ -1422,7 +1422,7 @@ typeName DynamicValue::Builder::AsImpl<typeName>::apply(Builder& builder) { \
     case FLOAT: \
       return ifFloat<typeName>(builder.floatValue); \
     default: \
-      KJ_FAIL_REQUIRE("Type mismatch when using DynamicValue::Builder::as().") { \
+      KJ_FAIL_REQUIRE("Value type mismatch.") { \
         return 0; \
       } \
   } \
@@ -1443,15 +1443,13 @@ HANDLE_NUMERIC_TYPE(double, kj::implicitCast, kj::implicitCast, kj::implicitCast
 
 #define HANDLE_TYPE(name, discrim, typeName) \
 ReaderFor<typeName> DynamicValue::Reader::AsImpl<typeName>::apply(const Reader& reader) { \
-  KJ_REQUIRE(reader.type == discrim, \
-      "Type mismatch when using DynamicValue::Reader::as().") { \
+  KJ_REQUIRE(reader.type == discrim, "Value type mismatch.") { \
     return ReaderFor<typeName>(); \
   } \
   return reader.name##Value; \
 } \
 BuilderFor<typeName> DynamicValue::Builder::AsImpl<typeName>::apply(Builder& builder) { \
-  KJ_REQUIRE(builder.type == discrim, \
-      "Type mismatch when using DynamicValue::Builder::as().") { \
+  KJ_REQUIRE(builder.type == discrim, "Value type mismatch.") { \
     return BuilderFor<typeName>(); \
   } \
   return builder.name##Value; \
@@ -1472,13 +1470,13 @@ HANDLE_TYPE(union, UNION, DynamicUnion)
 
 // As in the header, HANDLE_TYPE(void, VOID, Void) crashes GCC 4.7.
 Void DynamicValue::Reader::AsImpl<Void>::apply(const Reader& reader) {
-  KJ_REQUIRE(reader.type == VOID, "Type mismatch when using DynamicValue::Reader::as().") {
+  KJ_REQUIRE(reader.type == VOID, "Value type mismatch.") {
     return Void();
   }
   return reader.voidValue;
 }
 Void DynamicValue::Builder::AsImpl<Void>::apply(Builder& builder) {
-  KJ_REQUIRE(builder.type == VOID, "Type mismatch when using DynamicValue::Builder::as().") {
+  KJ_REQUIRE(builder.type == VOID, "Value type mismatch.") {
     return Void();
   }
   return builder.voidValue;
@@ -1559,12 +1557,12 @@ DynamicList::Builder PointerHelpers<DynamicList, Kind::UNKNOWN>::init(
 
 // -------------------------------------------------------------------
 
-Orphan<DynamicStruct> Orphanage::newOrphan(StructSchema schema) {
+Orphan<DynamicStruct> Orphanage::newOrphan(StructSchema schema) const {
   return Orphan<DynamicStruct>(
       schema, _::OrphanBuilder::initStruct(arena, structSizeFromSchema(schema)));
 }
 
-Orphan<DynamicList> Orphanage::newOrphan(ListSchema schema, uint size) {
+Orphan<DynamicList> Orphanage::newOrphan(ListSchema schema, uint size) const {
   if (schema.whichElementType() == schema::Type::Body::STRUCT_TYPE) {
     return Orphan<DynamicList>(schema, _::OrphanBuilder::initStructList(
         arena, size * ELEMENTS, structSizeFromSchema(schema.getStructElementType())));
@@ -1578,6 +1576,10 @@ DynamicStruct::Builder Orphan<DynamicStruct>::get() {
   return DynamicStruct::Builder(schema, builder.asStruct(structSizeFromSchema(schema)));
 }
 
+DynamicStruct::Reader Orphan<DynamicStruct>::getReader() const {
+  return DynamicStruct::Reader(schema, builder.asStructReader(structSizeFromSchema(schema)));
+}
+
 DynamicList::Builder Orphan<DynamicList>::get() {
   if (schema.whichElementType() == schema::Type::Body::STRUCT_TYPE) {
     return DynamicList::Builder(
@@ -1586,6 +1588,11 @@ DynamicList::Builder Orphan<DynamicList>::get() {
     return DynamicList::Builder(
         schema, builder.asList(elementSizeFor(schema.whichElementType())));
   }
+}
+
+DynamicList::Reader Orphan<DynamicList>::getReader() const {
+  return DynamicList::Reader(
+      schema, builder.asListReader(elementSizeFor(schema.whichElementType())));
 }
 
 }  // namespace capnp

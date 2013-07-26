@@ -109,6 +109,8 @@ DynamicTypeFor<TypeIfEnum<T>> toDynamic(T&& value);
 class DynamicEnum {
 public:
   DynamicEnum() = default;
+  inline DynamicEnum(EnumSchema::Enumerant enumerant)
+      : schema(enumerant.getContainingEnum()), value(enumerant.getOrdinal()) {}
 
   template <typename T, typename = kj::EnableIf<kind<T>() == Kind::ENUM>>
   inline DynamicEnum(T&& value): DynamicEnum(toDynamic(value)) {}
@@ -306,6 +308,7 @@ private:
   friend kj::String _::structString(
       _::StructReader reader, const _::RawSchema& schema);
   friend class Orphanage;
+  friend class Orphan<DynamicStruct>;
 };
 
 class DynamicStruct::Builder {
@@ -456,6 +459,7 @@ private:
   template <typename T, ::capnp::Kind k>
   friend struct ::capnp::ToDynamic_;
   friend class Orphanage;
+  friend class Orphan<DynamicList>;
 };
 
 class DynamicList::Builder {
@@ -685,6 +689,7 @@ public:
   Orphan& operator=(Orphan&&) = default;
 
   DynamicStruct::Builder get();
+  DynamicStruct::Reader getReader() const;
 
   inline bool operator==(decltype(nullptr)) { return builder == nullptr; }
   inline bool operator!=(decltype(nullptr)) { return builder == nullptr; }
@@ -711,6 +716,7 @@ public:
   Orphan& operator=(Orphan&&) = default;
 
   DynamicList::Builder get();
+  DynamicList::Reader getReader() const;
 
   inline bool operator==(decltype(nullptr)) { return builder == nullptr; }
   inline bool operator!=(decltype(nullptr)) { return builder == nullptr; }
@@ -744,14 +750,14 @@ struct Orphanage::GetInnerBuilder<DynamicList, Kind::UNKNOWN> {
 
 template <>
 inline Orphan<DynamicStruct> Orphanage::newOrphanCopy<DynamicStruct::Reader>(
-    const DynamicStruct::Reader& copyFrom) {
+    const DynamicStruct::Reader& copyFrom) const {
   return Orphan<DynamicStruct>(
       copyFrom.getSchema(), _::OrphanBuilder::copy(arena, copyFrom.reader));
 }
 
 template <>
 inline Orphan<DynamicList> Orphanage::newOrphanCopy<DynamicList::Reader>(
-    const DynamicList::Reader& copyFrom) {
+    const DynamicList::Reader& copyFrom) const {
   return Orphan<DynamicList>(copyFrom.getSchema(), _::OrphanBuilder::copy(arena, copyFrom.reader));
 }
 

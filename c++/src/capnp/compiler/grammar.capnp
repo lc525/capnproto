@@ -69,6 +69,9 @@ struct DeclName {
 
   memberPath @4 :List(LocatedText);
   # List of `.member` suffixes.
+
+  startByte @5 :UInt32;
+  endByte @6 :UInt32;
 }
 
 struct TypeExpression {
@@ -95,7 +98,7 @@ struct ValueExpression {
     negativeInt @3 :UInt64;
     float @4 :Float64;
     string @5 :Text;
-    identifier @6 :Text;
+    name @6 :DeclName;
     list @7 :List(ValueExpression);
     structValue @8 :List(FieldAssignment);
     unionValue @9 :FieldAssignment;
@@ -139,6 +142,7 @@ struct Declaration {
   docComment @20 :Text;
 
   body @6 union {
+    fileDecl @24 :File;
     usingDecl @7 :Using;
     constDecl @8 :Const;
     enumDecl @9 :Enum;
@@ -151,13 +155,37 @@ struct Declaration {
     methodDecl @15 :Method;
     annotationDecl @16 :Annotation;
 
-    nakedId @21 :UInt64;
+    nakedId @21 :LocatedInteger;
     nakedAnnotation @22 :AnnotationApplication;
     # A floating UID or annotation (allowed at the file top level).
+
+    # The following declaration types are not produced by the parser, but are declared here
+    # so that the compiler can handle symbol name lookups more uniformly.
+    #
+    # New union members added here will magically become visible in the global scope.
+    # E.g. "builtinFoo" becomes visible as "Foo".
+    builtinVoid @25 :Void;
+    builtinBool @26 :Void;
+    builtinInt8 @27 :Void;
+    builtinInt16 @28 :Void;
+    builtinInt32 @29 :Void;
+    builtinInt64 @30 :Void;
+    builtinUInt8 @31 :Void;
+    builtinUInt16 @32 :Void;
+    builtinUInt32 @33 :Void;
+    builtinUInt64 @34 :Void;
+    builtinFloat32 @35 :Void;
+    builtinFloat64 @36 :Void;
+    builtinText @37 :Void;
+    builtinData @38 :Void;
+    builtinList @39 :Void;
+    builtinObject @40 :Void;
   }
 
+  struct File {}
+
   struct Using {
-    target @0 :TypeExpression;
+    target @0 :DeclName;
   }
 
   struct Const {
@@ -221,9 +249,5 @@ struct Declaration {
 }
 
 struct ParsedFile {
-  id @0 :UInt64;
-  annotations @1 :List(Declaration.AnnotationApplication);
-  docComment @2 :Text;
-
-  topDecls @3 :List(Declaration);
+  root @0 :Declaration;
 }

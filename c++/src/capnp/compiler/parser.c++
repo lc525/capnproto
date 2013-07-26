@@ -28,6 +28,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <limits>
 
 namespace capnp {
 namespace compiler {
@@ -44,19 +45,20 @@ uint64_t randomId() {
   KJ_SYSCALL(n = read(fd, &result, sizeof(result)), "/dev/urandom");
   KJ_ASSERT(n == sizeof(result), "Incomplete read from /dev/urandom.", n);
 
-  return result;
+  return result | (1ull << 63);
 }
 
 }  // namespace
 
 void parseFile(List<Statement>::Reader statements, ParsedFile::Builder result,
-               ErrorReporter& errorReporter) {
+               const ErrorReporter& errorReporter) {
   CapnpParser parser(Orphanage::getForMessageContaining(result), errorReporter);
 
   kj::Vector<Orphan<Declaration>> decls(statements.size());
   kj::Vector<Orphan<Declaration::AnnotationApplication>> annotations;
 
-  bool sawId = false;
+  auto fileDecl = result.getRoot();
+  fileDecl.getBody().initFileDecl();
 
   for (auto statement: statements) {
     KJ_IF_MAYBE(decl, parser.parseStatement(statement, parser.getParsers().fileLevelDecl)) {
@@ -64,14 +66,13 @@ void parseFile(List<Statement>::Reader statements, ParsedFile::Builder result,
       auto body = builder.getBody();
       switch (body.which()) {
         case Declaration::Body::NAKED_ID:
-          if (sawId) {
+          if (fileDecl.getId().which() == Declaration::Id::UID) {
             errorReporter.addError(builder.getStartByte(), builder.getEndByte(),
-                                   kj::str("File can only have one ID."));
+                                   "File can only have one ID.");
           } else {
-            sawId = true;
-            result.setId(body.getNakedId());
+            fileDecl.getId().adoptUid(body.disownNakedId());
             if (builder.hasDocComment()) {
-              result.adoptDocComment(builder.disownDocComment());
+              fileDecl.adoptDocComment(builder.disownDocComment());
             }
           }
           break;
@@ -85,18 +86,20 @@ void parseFile(List<Statement>::Reader statements, ParsedFile::Builder result,
     }
   }
 
-  if (!sawId) {
+  if (fileDecl.getId().which() != Declaration::Id::UID) {
+    uint64_t id = randomId();
+    fileDecl.getId().initUid().setValue(id);
     errorReporter.addError(0, 0,
         kj::str("File does not declare an ID.  I've generated one for you.  Add this line to your "
-                "file: @0x", kj::hex(randomId() | (1ull << 63)), ";"));
+                "file: @0x", kj::hex(id), ";"));
   }
 
-  auto declsBuilder = result.initTopDecls(decls.size());
+  auto declsBuilder = fileDecl.initNestedDecls(decls.size());
   for (size_t i = 0; i < decls.size(); i++) {
     declsBuilder.adoptWithCaveats(i, kj::mv(decls[i]));
   }
 
-  auto annotationsBuilder = result.initAnnotations(annotations.size());
+  auto annotationsBuilder = fileDecl.initAnnotations(annotations.size());
   for (size_t i = 0; i < annotations.size(); i++) {
     annotationsBuilder.adoptWithCaveats(i, kj::mv(annotations[i]));
   }
@@ -200,7 +203,7 @@ class ParseListItems {
   // Transformer that parses all items in the input token sequence list using the given parser.
 
 public:
-  constexpr ParseListItems(ItemParser&& itemParser, ErrorReporter& errorReporter)
+  constexpr ParseListItems(ItemParser&& itemParser, const ErrorReporter& errorReporter)
       : itemParser(p::sequence(kj::fwd<ItemParser>(itemParser), p::endOfInput)),
         errorReporter(errorReporter) {}
 
@@ -218,20 +221,17 @@ public:
         if (best < item.end()) {
           // Report error from the point where parsing failed to the end of the item.
           errorReporter.addError(
-              best->getStartByte(), (item.end() - 1)->getEndByte(),
-              kj::str("Parse error."));
+              best->getStartByte(), (item.end() - 1)->getEndByte(), "Parse error.");
         } else if (item.size() > 0) {
           // The item is non-empty and the parser consumed all of it before failing.  Report an
           // error for the whole thing.
           errorReporter.addError(
-              item.begin()->getStartByte(), (item.end() - 1)->getEndByte(),
-              kj::str("Parse error."));
+              item.begin()->getStartByte(), (item.end() - 1)->getEndByte(), "Parse error.");
         } else {
           // The item has no content.
           // TODO(cleanup):  We don't actually know the item's location, so we can only report
           //   an error across the whole list.  Fix this.
-          errorReporter.addError(items.startByte, items.endByte,
-              kj::str("Parse error: Empty list item."));
+          errorReporter.addError(items.startByte, items.endByte, "Parse error: Empty list item.");
         }
       }
     }
@@ -241,11 +241,12 @@ public:
 
 private:
   decltype(p::sequence(kj::instance<ItemParser>(), p::endOfInput)) itemParser;
-  ErrorReporter& errorReporter;
+  const ErrorReporter& errorReporter;
 };
 
 template <typename ItemParser>
-constexpr auto parenthesizedList(ItemParser&& itemParser, ErrorReporter& errorReporter) -> decltype(
+constexpr auto parenthesizedList(ItemParser&& itemParser,
+                                 const ErrorReporter& errorReporter) -> decltype(
          transform(rawParenthesizedList, ParseListItems<ItemParser>(
              kj::fwd<ItemParser>(itemParser), errorReporter))) {
   return transform(rawParenthesizedList, ParseListItems<ItemParser>(
@@ -253,7 +254,8 @@ constexpr auto parenthesizedList(ItemParser&& itemParser, ErrorReporter& errorRe
 }
 
 template <typename ItemParser>
-constexpr auto bracketedList(ItemParser&& itemParser, ErrorReporter& errorReporter) -> decltype(
+constexpr auto bracketedList(ItemParser&& itemParser,
+                             const ErrorReporter& errorReporter) -> decltype(
          transform(rawBracketedList, ParseListItems<ItemParser>(
              kj::fwd<ItemParser>(itemParser), errorReporter))) {
   return transform(rawBracketedList, ParseListItems<ItemParser>(
@@ -300,13 +302,22 @@ inline Declaration::Builder initMemberDecl(
   return builder;
 }
 
+template <typename BuilderType>
+void initLocation(kj::parse::Span<List<Token>::Reader::Iterator> location,
+                  BuilderType builder) {
+  if (location.begin() < location.end()) {
+    builder.setStartByte(location.begin()->getStartByte());
+    builder.setEndByte((location.end() - 1)->getEndByte());
+  }
+}
+
 }  // namespace
 
 // =======================================================================================
 
-CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterParam)
+CapnpParser::CapnpParser(Orphanage orphanageParam, const ErrorReporter& errorReporterParam)
     : orphanage(orphanageParam), errorReporter(errorReporterParam) {
-  parsers.declName = arena.copy(p::transform(
+  parsers.declName = arena.copy(p::transformWithLocation(
       p::sequence(
           p::oneOf(
               p::transform(p::sequence(keyword("import"), stringLiteral),
@@ -328,19 +339,23 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
                     return result;
                   })),
           p::many(p::sequence(op("."), identifier))),
-      [this](Orphan<DeclName>&& result, kj::Array<Located<Text::Reader>>&& memberPath)
+      [this](kj::parse::Span<List<Token>::Reader::Iterator> location,
+             Orphan<DeclName>&& result, kj::Array<Located<Text::Reader>>&& memberPath)
           -> Orphan<DeclName> {
-        auto builder = result.get().initMemberPath(memberPath.size());
+        auto builder = result.get();
+        auto pathBuilder = builder.initMemberPath(memberPath.size());
         for (size_t i = 0; i < memberPath.size(); i++) {
-          memberPath[i].copyTo(builder[i]);
+          memberPath[i].copyTo(pathBuilder[i]);
         }
+        initLocation(location, builder);
         return kj::mv(result);
       }));
 
-  parsers.typeExpression = arena.copy(p::transform(
+  parsers.typeExpression = arena.copy(p::transformWithLocation(
       p::sequence(parsers.declName, p::optional(
           parenthesizedList(parsers.typeExpression, errorReporter))),
-      [this](Orphan<DeclName>&& name,
+      [this](kj::parse::Span<List<Token>::Reader::Iterator> location,
+             Orphan<DeclName>&& name,
              kj::Maybe<Located<kj::Array<kj::Maybe<Orphan<TypeExpression>>>>>&& params)
              -> Orphan<TypeExpression> {
         auto result = orphanage.newOrphan<TypeExpression>();
@@ -357,6 +372,7 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
             }
           }
         }
+        initLocation(location, builder);
         return result;
       }));
 
@@ -411,7 +427,7 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
             } else {
               auto fieldValue = field->get().getValue();
               errorReporter.addError(fieldValue.getStartByte(), fieldValue.getEndByte(),
-                                     kj::str("Missing field name."));
+                                     "Missing field name.");
             }
           }
         }
@@ -452,6 +468,15 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
             value.copyLocationTo(builder);
             return result;
           }),
+      p::transformWithLocation(p::sequence(op("-"), keyword("inf")),
+          [this](kj::parse::Span<List<Token>::Reader::Iterator> location)
+              -> Orphan<ValueExpression> {
+            auto result = orphanage.newOrphan<ValueExpression>();
+            auto builder = result.get();
+            builder.getBody().setFloat(-std::numeric_limits<double>::infinity());
+            initLocation(location, builder);
+            return result;
+          }),
       p::transform(stringLiteral,
           [this](Located<Text::Reader>&& value) -> Orphan<ValueExpression> {
             auto result = orphanage.newOrphan<ValueExpression>();
@@ -475,12 +500,13 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
 
             return result;
           }),
-      p::transform(identifier,
-          [this](Located<Text::Reader>&& value) -> Orphan<ValueExpression> {
+      p::transformWithLocation(parsers.declName,
+          [this](kj::parse::Span<List<Token>::Reader::Iterator> location,
+                 Orphan<DeclName>&& value) -> Orphan<ValueExpression> {
             auto result = orphanage.newOrphan<ValueExpression>();
             auto builder = result.get();
-            builder.getBody().setIdentifier(value.value);
-            value.copyLocationTo(builder);
+            builder.getBody().adoptName(kj::mv(value));
+            initLocation(location, builder);
             return result;
           }),
       p::transform(bracketedList(parsers.valueExpression, errorReporter),
@@ -510,7 +536,7 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
                 } else {
                   auto fieldValue = field->get().getValue();
                   errorReporter.addError(fieldValue.getStartByte(), fieldValue.getEndByte(),
-                                         kj::str("Missing field name."));
+                                         "Missing field name.");
                 }
               }
             }
@@ -519,10 +545,9 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
           })
       ));
 
-  parsers.annotation = arena.copy(p::transformWithLocation(
+  parsers.annotation = arena.copy(p::transform(
       p::sequence(op("$"), parsers.declName, p::optional(parsers.parenthesizedValueExpression)),
-      [this](kj::parse::Span<List<Token>::Reader::Iterator> location,
-             Orphan<DeclName>&& name, kj::Maybe<Orphan<ValueExpression>>&& value)
+      [this](Orphan<DeclName>&& name, kj::Maybe<Orphan<ValueExpression>>&& value)
           -> Orphan<Declaration::AnnotationApplication> {
         auto result = orphanage.newOrphan<Declaration::AnnotationApplication>();
         auto builder = result.get();
@@ -540,7 +565,7 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
       [this](Located<uint64_t>&& value) {
         if (value.value < (1ull << 63)) {
           errorReporter.addError(value.startByte, value.endByte,
-              kj::str("Invalid ID.  Please generate a new one with 'capnpc -i'."));
+              "Invalid ID.  Please generate a new one with 'capnpc -i'.");
         }
         return value.asProto<LocatedInteger>(orphanage);
       }));
@@ -550,7 +575,7 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
       [this](Located<uint64_t>&& value) {
         if (value.value >= 65536) {
           errorReporter.addError(value.startByte, value.endByte,
-              kj::str("Ordinals cannot be greater than 65535."));
+              "Ordinals cannot be greater than 65535.");
         }
         return value.asProto<LocatedInteger>(orphanage);
       }));
@@ -558,13 +583,13 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
   // -----------------------------------------------------------------
 
   parsers.usingDecl = arena.copy(p::transform(
-      p::sequence(keyword("using"), identifier, op("="), parsers.typeExpression),
-      [this](Located<Text::Reader>&& name, Orphan<TypeExpression>&& type) -> DeclParserResult {
+      p::sequence(keyword("using"), identifier, op("="), parsers.declName),
+      [this](Located<Text::Reader>&& name, Orphan<DeclName>&& target) -> DeclParserResult {
         auto decl = orphanage.newOrphan<Declaration>();
         auto builder = decl.get();
         name.copyTo(builder.initName());
         // no id, no annotations for using decl
-        builder.getBody().initUsingDecl().adoptTarget(kj::mv(type));
+        builder.getBody().initUsingDecl().adoptTarget(kj::mv(target));
         return DeclParserResult(kj::mv(decl));
       }));
 
@@ -666,7 +691,7 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
         return DeclParserResult(kj::mv(decl), parsers.structLevelDecl);
       }));
 
-  parsers.unionDecl = arena.copy(p::transform(
+  parsers.groupDecl = arena.copy(p::transform(
       p::sequence(keyword("group"), p::many(parsers.annotation)),
       [this](kj::Array<Orphan<Declaration::AnnotationApplication>>&& annotations)
                  -> DeclParserResult {
@@ -777,7 +802,7 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
               // Set all.
               if (targets.value.size() > 1) {
                 errorReporter.addError(target->startByte, target->endByte,
-                    kj::str("Wildcard should not be specified together with other targets."));
+                    "Wildcard should not be specified together with other targets.");
               }
 
               for (auto member: dynamicBuilder.getSchema().getMembers()) {
@@ -789,7 +814,7 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
               if (target->value.size() == 0 || target->value.size() >= 32 ||
                   target->value[0] < 'a' || target->value[0] > 'z') {
                 errorReporter.addError(target->startByte, target->endByte,
-                    kj::str("Not a valid annotation target."));
+                                       "Not a valid annotation target.");
               } else {
                 char buffer[64];
                 strcpy(buffer, "targets");
@@ -798,12 +823,12 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
                 KJ_IF_MAYBE(member, dynamicBuilder.getSchema().findMemberByName(buffer)) {
                   if (dynamicBuilder.get(*member).as<bool>()) {
                     errorReporter.addError(target->startByte, target->endByte,
-                        kj::str("Duplicate target specification."));
+                                           "Duplicate target specification.");
                   }
                   dynamicBuilder.set(*member, true);
                 } else {
                   errorReporter.addError(target->startByte, target->endByte,
-                      kj::str("Not a valid annotation target."));
+                                         "Not a valid annotation target.");
                 }
               }
             }
@@ -817,7 +842,7 @@ CapnpParser::CapnpParser(Orphanage orphanageParam, ErrorReporter& errorReporterP
   auto& nakedId = arena.copy(p::transform(parsers.uid,
       [this](Orphan<LocatedInteger>&& value) -> DeclParserResult {
         auto decl = orphanage.newOrphan<Declaration>();
-        decl.get().getBody().setNakedId(value.get().getValue());
+        decl.get().getBody().adoptNakedId(kj::mv(value));
         return DeclParserResult(kj::mv(decl));
       }));
 
@@ -865,7 +890,7 @@ kj::Maybe<Orphan<Declaration>> CapnpParser::parseStatement(
       case Statement::Block::NONE:
         if (output->memberParser != nullptr) {
           errorReporter.addError(statement.getStartByte(), statement.getEndByte(),
-              kj::str("This statement should end with a semicolon, not a block."));
+              "This statement should end with a semicolon, not a block.");
         }
         break;
 
@@ -881,7 +906,7 @@ kj::Maybe<Orphan<Declaration>> CapnpParser::parseStatement(
           builder.adoptNestedDecls(arrayToList(orphanage, members.releaseAsArray()));
         } else {
           errorReporter.addError(statement.getStartByte(), statement.getEndByte(),
-              kj::str("This statement should end with a block, not a semicolon."));
+              "This statement should end with a block, not a semicolon.");
         }
         break;
     }
@@ -901,7 +926,7 @@ kj::Maybe<Orphan<Declaration>> CapnpParser::parseStatement(
       bestByte = 0;
     }
 
-    errorReporter.addError(bestByte, bestByte, kj::str("Parse error."));
+    errorReporter.addError(bestByte, bestByte, "Parse error.");
     return nullptr;
   }
 }

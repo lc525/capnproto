@@ -21,34 +21,42 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#ifndef ERROR_REPORTER_H_
-#define ERROR_REPORTER_H_
+#ifndef CAPNP_COMPILER_MODULE_LOADER_H_
+#define CAPNP_COMPILER_MODULE_LOADER_H_
 
-#include "../common.h"
+#include "compiler.h"
+#include <kj/memory.h>
+#include <kj/array.h>
 #include <kj/string.h>
 
 namespace capnp {
 namespace compiler {
 
-class ErrorReporter {
+class ModuleLoader {
 public:
-  virtual ~ErrorReporter() noexcept(false);
+  explicit ModuleLoader(int errorFd);
+  // Create a ModuleLoader that writes error messages to the given file descriptor.
 
-  virtual void addError(uint32_t startByte, uint32_t endByte, kj::StringPtr message) const = 0;
-  // Report an error at the given location in the input text.  `startByte` and `endByte` indicate
-  // the span of text that is erroneous.  They may be equal, in which case the parser was only
-  // able to identify where the error begins, not where it ends.
+  KJ_DISALLOW_COPY(ModuleLoader);
 
-  template <typename T>
-  inline void addErrorOn(T&& decl, kj::StringPtr message) const {
-    // Works for any `T` that defines `getStartByte()` and `getEndByte()` methods, which many
-    // of the Cap'n Proto types defined in `grammar.capnp` do.
+  ~ModuleLoader();
 
-    addError(decl.getStartByte(), decl.getEndByte(), message);
-  }
+  void addImportPath(kj::String path);
+  // Add a directory to the list of paths that is searched for imports that start with a '/'.
+
+  kj::Maybe<const Module&> loadModule(kj::StringPtr localName, kj::StringPtr sourceName) const;
+  // Tries to load the module with the given filename.  `localName` is the path to the file on
+  // disk (as you'd pass to open(2)), and `sourceName` is the canonical name it should be given
+  // in the schema (this is used e.g. to decide output file locations).  Often, these are the same.
+
+private:
+  class Impl;
+  kj::Own<Impl> impl;
+
+  class ModuleImpl;
 };
 
 }  // namespace compiler
 }  // namespace capnp
 
-#endif  // ERROR_REPORTER_H_
+#endif  // CAPNP_COMPILER_MODULE_LOADER_H_
