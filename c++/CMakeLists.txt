@@ -131,9 +131,6 @@ get_target_property(CAPNPC_EXECUTABLE capnp-exe LOCATION)
 get_target_property(CAPNPC_CXX_EXECUTABLE capnpc-c++ LOCATION)
 set(CAPNPC_IMPORT_PATH ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-message(STATUS "exe: ${CAPNPC_EXECUTABLE}")
-message(STATUS "exe-c++: ${CAPNPC_CXX_EXECUTABLE}")
-
 include(capnpc) # for capnp_generate_cpp()
 
 set(test_capnpc_inputs
