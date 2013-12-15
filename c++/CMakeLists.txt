@@ -1,41 +1,202 @@
+cmake_minimum_required(VERSION 2.8)
+project(capnproto CXX C)
+
+set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../cmake)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+
 find_package(Threads REQUIRED)
+link_libraries(${CMAKE_THREAD_LIBS_INIT}) # -lpthread(s) for all targets
+
+include(ExternalProject)
+include(CTest)
+enable_testing()
 
 ExternalProject_Add(gtest
-     DOWNLOAD_DIR ${CMAKE_CURRENT_BINARY_DIR}/gtest
-     SVN_REPOSITORY http://googletest.googlecode.com/svn/tags/release-1.6.0
-     UPDATE_COMMAND ""
-     PATCH_COMMAND patch -p0 < ${CMAKE_CURRENT_SOURCE_DIR}/gtest-1.6.0-c++11.patch
-     CMAKE_ARGS -DCMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}
-     INSTALL_COMMAND ""
+    DOWNLOAD_DIR ${CMAKE_CURRENT_BINARY_DIR}/gtest
+    SVN_REPOSITORY http://googletest.googlecode.com/svn/tags/release-1.7.0
+    UPDATE_COMMAND ""
+    CMAKE_ARGS -DCMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}
+    INSTALL_COMMAND ""
 )
 
 ExternalProject_Get_Property(gtest source_dir)
-include_directories(${source_dir}/include)
 ExternalProject_Get_Property(gtest binary_dir)
 set(gtest_library "${binary_dir}/libgtest.a")
 set(gtest_main_library "${binary_dir}/libgtest_main.a")
+set(gtest_both_libraries "${gtest_library};${gtest_main_library}")
+set(gtest_include_dir ${source_dir}/include)
 
-if(USE_SNAPPY)
-    ExternalProject_Add(snappy
-         DOWNLOAD_DIR ${CMAKE_CURRENT_BINARY_DIR}/snappy
-         SVN_REPOSITORY http://snappy.googlecode.com/svn/trunk
-         SVN_REVISION -r 78
-         CONFIGURE_COMMAND cd <SOURCE_DIR> && <SOURCE_DIR>/autogen.sh && cd - && <SOURCE_DIR>/configure
-         BUILD_COMMAND ${MAKE}
-         UPDATE_COMMAND ""
-         INSTALL_COMMAND ""
-    )
-
-    ExternalProject_Get_Property(snappy source_dir)
-    include_directories(${source_dir})
-    ExternalProject_Get_Property(snappy binary_dir)
-    set(SNAPPY_LIBRARIES "${binary_dir}/.libs/libsnappy.a")
-endif()
-
+include_directories(${gtest_include_dir})
 include_directories(src)
+include_directories(${CMAKE_CURRENT_BINARY_DIR}/src)
 
-add_subdirectory(src)
+set(kj_sources
+    src/kj/common.c++
+    src/kj/units.c++
+    src/kj/memory.c++
+    src/kj/refcount.c++
+    src/kj/array.c++
+    src/kj/string.c++
+    src/kj/string-tree.c++
+    src/kj/exception.c++
+    src/kj/debug.c++
+    src/kj/arena.c++
+    src/kj/io.c++
+    src/kj/mutex.c++
+    src/kj/thread.c++
+    src/kj/main.c++
+    src/kj/parse/char.c++
+)
 
-if(BUILD_SAMPLES)
-    add_subdirectory(samples)
-endif()
+add_library(kj ${kj_sources})
+target_link_libraries(kj)
+
+set(kj_async_sources
+    src/kj/async.c++
+    src/kj/async-unix.c++
+    src/kj/async-io.c++
+)
+
+add_library(kj-async ${kj_async_sources})
+target_link_libraries(kj-async kj)
+
+
+set(capnp_sources
+    src/capnp/c++.capnp.c++
+    src/capnp/blob.c++
+    src/capnp/arena.c++
+    src/capnp/layout.c++
+    src/capnp/list.c++
+    src/capnp/any.c++
+    src/capnp/message.c++
+    src/capnp/schema.capnp.c++
+    src/capnp/schema.c++
+    src/capnp/schema-loader.c++
+    src/capnp/dynamic.c++
+    src/capnp/stringify.c++
+    src/capnp/serialize.c++
+    src/capnp/serialize-packed.c++
+)
+
+add_library(capnp ${capnp_sources})
+target_link_libraries(capnp kj)
+
+
+set(capnp_rpc_sources
+    src/capnp/serialize-async.c++
+    src/capnp/capability.c++
+    src/capnp/dynamic-capability.c++
+    src/capnp/rpc.c++
+    src/capnp/rpc.capnp.c++
+    src/capnp/rpc-twoparty.c++
+    src/capnp/rpc-twoparty.capnp.c++
+    src/capnp/ez-rpc.c++
+)
+
+add_library(capnp-rpc ${capnp_rpc_sources})
+target_link_libraries(capnp-rpc capnp kj kj-async)
+
+set(capnpc_sources
+    src/capnp/compiler/md5.c++
+    src/capnp/compiler/error-reporter.c++
+    src/capnp/compiler/lexer.capnp.c++
+    src/capnp/compiler/lexer.c++
+    src/capnp/compiler/grammar.capnp.c++
+    src/capnp/compiler/parser.c++
+    src/capnp/compiler/node-translator.c++
+    src/capnp/compiler/compiler.c++
+    src/capnp/schema-parser.c++
+)
+
+add_library(capnpc ${capnpc_sources})
+target_link_libraries(capnpc capnp kj)
+
+set(capnp_binary_sources
+    src/capnp/compiler/module-loader.c++
+    src/capnp/compiler/capnp.c++
+)
+
+add_executable(capnp-exe ${capnp_binary_sources})
+set_target_properties(capnp-exe PROPERTIES OUTPUT_NAME capnp)
+target_link_libraries(capnp-exe capnpc capnp kj)
+
+add_executable(capnpc-capnp src/capnp/compiler/capnpc-capnp.c++)
+target_link_libraries(capnpc-capnp capnp kj)
+
+add_executable(capnpc-c++ src/capnp/compiler/capnpc-c++.c++)
+target_link_libraries(capnpc-c++ capnp kj)
+
+
+get_target_property(CAPNPC_EXECUTABLE capnp-exe LOCATION)
+get_target_property(CAPNPC_CXX_EXECUTABLE capnpc-c++ LOCATION)
+set(CAPNPC_IMPORT_PATH ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+message(STATUS "exe: ${CAPNPC_EXECUTABLE}")
+message(STATUS "exe-c++: ${CAPNPC_CXX_EXECUTABLE}")
+
+include(capnpc) # for capnp_generate_cpp()
+
+set(test_capnpc_inputs
+    src/capnp/test.capnp
+    src/capnp/test-import.capnp
+    src/capnp/test-import2.capnp
+)
+
+capnp_generate_cpp(test_capnpc_sources test_capnpc_headers ${test_capnpc_inputs})
+
+set(capnp_test_sources
+    ${test_capnpc_sources}
+    src/kj/common-test.c++
+    src/kj/memory-test.c++
+    src/kj/refcount-test.c++
+    src/kj/array-test.c++
+    src/kj/string-test.c++
+    src/kj/string-tree-test.c++
+    src/kj/exception-test.c++
+    src/kj/debug-test.c++
+    src/kj/arena-test.c++
+    src/kj/units-test.c++
+    src/kj/tuple-test.c++
+    src/kj/one-of-test.c++
+    src/kj/function-test.c++
+    src/kj/mutex-test.c++
+    src/kj/async-test.c++
+    src/kj/async-unix-test.c++
+    src/kj/async-io-test.c++
+    src/kj/parse/common-test.c++
+    src/kj/parse/char-test.c++
+    src/capnp/common-test.c++
+    src/capnp/blob-test.c++
+    src/capnp/endian-test.c++
+    src/capnp/endian-fallback-test.c++
+    src/capnp/endian-reverse-test.c++
+    src/capnp/layout-test.c++
+    src/capnp/any-test.c++
+    src/capnp/message-test.c++
+    src/capnp/capability-test.c++
+    src/capnp/schema-test.c++
+    src/capnp/schema-loader-test.c++
+    src/capnp/dynamic-test.c++
+    src/capnp/stringify-test.c++
+    src/capnp/encoding-test.c++
+    src/capnp/orphan-test.c++
+    src/capnp/serialize-test.c++
+    src/capnp/serialize-async-test.c++
+    src/capnp/serialize-packed-test.c++
+    src/capnp/rpc-test.c++
+    src/capnp/rpc-twoparty-test.c++
+    src/capnp/ez-rpc-test.c++
+    src/capnp/test-util.c++
+    src/capnp/compiler/lexer-test.c++
+    src/capnp/compiler/md5-test.c++
+)
+
+add_executable(capnp-test ${capnp_test_sources})
+target_link_libraries(capnp-test ${gtest_both_libraries} capnpc capnp-rpc capnp kj-async kj)
+add_dependencies(capnp-test gtest capnp-exe capnpc-c++)
+add_test(capnp ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/capnp-test)
+
+add_executable(capnp-evolution-test src/capnp/compiler/evolution-test.c++)
+target_link_libraries(capnp-evolution-test ${gtest_both_libraries} capnpc capnp-rpc capnp kj-async kj)
+add_dependencies(capnp-evolution-test gtest)
+add_test(capnp-evolution ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/capnp-evolution-test)

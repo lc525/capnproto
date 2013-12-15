@@ -15,9 +15,6 @@ function(CAPNP_GENERATE_CPP SRCS HDRS)
     return()
   endif(NOT ARGN)
 
-  #Some hardcode here, waiting for compiler in C++
-  set(CAPNPC_EXECUTABLE capnpc)
-
   if(CAPNP_GENERATE_CPP_APPEND_PATH)
     # Create an include path for each file specified
     foreach(FIL ${ARGN})
@@ -36,16 +33,15 @@ function(CAPNP_GENERATE_CPP SRCS HDRS)
   set(${HDRS})
   foreach(FIL ${ARGN})
     get_filename_component(ABS_FIL ${FIL} ABSOLUTE)
-    get_filename_component(FIL_WE ${FIL} NAME_WE)
 
-    list(APPEND ${SRCS} "${CMAKE_CURRENT_SOURCE_DIR}/${FIL_WE}.capnp.c++")
-    list(APPEND ${HDRS} "${CMAKE_CURRENT_SOURCE_DIR}/${FIL_WE}.capnp.h")
+    list(APPEND ${SRCS} "${CMAKE_CURRENT_BINARY_DIR}/${FIL}.c++")
+    list(APPEND ${HDRS} "${CMAKE_CURRENT_BINARY_DIR}/${FIL}.h")
 
     add_custom_command(
-      OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/${FIL_WE}.capnp.c++"
-             "${CMAKE_CURRENT_SOURCE_DIR}/${FIL_WE}.capnp.h"
+      OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${FIL}.c++"
+             "${CMAKE_CURRENT_BINARY_DIR}/${FIL}.h"
       COMMAND  ${CAPNPC_EXECUTABLE}
-      ARGS --src-prefix=${CMAKE_CURRENT_SOURCE_DIR} --output=c++:${CMAKE_CURRENT_SOURCE_DIR} ${_capnp_include_path} ${ABS_FIL}
+      ARGS compile --src-prefix=${CMAKE_CURRENT_SOURCE_DIR} --output=${CAPNPC_CXX_EXECUTABLE}:${CMAKE_CURRENT_BINARY_DIR} ${_capnp_include_path} -I${CAPNPC_IMPORT_PATH} ${ABS_FIL}
       DEPENDS ${ABS_FIL}
       COMMENT "Running C++ capnp compiler on ${FIL}"
       VERBATIM )
