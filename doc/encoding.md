@@ -159,71 +159,21 @@ A struct pointer looks like this:
     C (16 bits) = Size of the struct's data section, in words.
     D (16 bits) = Size of the struct's pointer section, in words.
 
-#### Field Positioning
+Fields are positioned within the struct according to an algorithm with the following principles:
 
-_WARNING:  You should not attempt to implement the following algorithm.  The compiled schemas
-produced by the Cap'n Proto compiler are already populated with offset information, so code
-generators and other consumers of compiled schemas should never need to compute them manually.
-The algorithm is complicated and easy to get wrong, so it is best to rely on the canonical
-implementation._
+* The position of each field depends only on its definition and the definitions of lower-numbered
+  fields, never on the definitions of higher-numbered fields.  This ensures backwards-compatibility
+  when new fields are added.
+* Due to alignment reqirements, fields in the data section may be separated by padding.  However,
+  later-numbered fields may be positioned into the padding left between earlier-numbered fields.
+  Because of this, a struct will never contain more than 63 bits of padding.  Since objects are
+  rounded up to a whole number of words anyway, padding never ends up wasting space.
+* Unions and groups need not occupy contiguous memory.  Indeed, they may have to be split into
+  multiple slots if new fields are added later on.
 
-Ignoring unions, the layout of fields within the struct is determined by the following algorithm:
-
-    For each field of the struct, ordered by field number {
-        If the field is a pointer {
-            Add it to the end of the pointer section.
-        } else if the data section layout so far includes properly-aligned
-                padding large enough to hold this field {
-            Replace the padding space with the new field, preferring to
-                put the field as close to the beginning of the section as
-                possible.
-        } else {
-            Add one word to the end of the data section.
-            Place the new field at the beginning of the new word.
-            Mark the rest of the new word as padding.
-        }
-    }
-
-Keep in mind that `Bool` fields are bit-aligned, so multiple booleans will be packed into a
-single byte.  As always, little-endian ordering is the standard -- the first boolean will be
-located at the least-significant bit of its byte.
-
-When unions are present, add the following logic:
-
-    For each field and union of the struct, ordered by field number {
-        If this is a union, not a field {
-            Treat it like a 16-bit field, representing the union tag.
-                (See no-union logic, above.)
-        } else if this field is a member of a union {
-            If an earlier member of the union is in the same section as
-                    this field and it combined with any following padding
-                    is at least as large as the new field {
-                Give the new field the same offset and the highest-numbered
-                    such previous field, so they overlap.
-            } else {
-                Assign a new offset to this field as if it were not a union
-                    member at all.  (See no-union logic, above.)
-            }
-        } else {
-            Assign an offset as normal.  (See no-union logic, above.)
-        }
-    }
-
-Note that in the worst case, the members of a union could end up using 23 bytes plus one bit (one
-pointer plus data section locations of 64, 32, 16, 8, and 1 bits).  This is an unfortunate side
-effect of the desire to pack fields in the smallest space where they will fit and the need to
-maintain backwards-compatibility as fields are added.  The worst case should be rare in practice,
-and can be avoided entirely by always declaring a union's largest member first.
-
-Inline fields add yet more complication.  An inline field may contain some data and some pointers,
-which are positioned independently.  If the data part is non-empty but is less than one word, it is
-rounded up to the nearest of 1, 2, or 4 bytes and treated the same as a field of that size.
-Otherwise, it is added to the end of the data section.  Any pointers are added to the end of the
-pointer section.  When an inline field appears inside a union, it will attempt to overlap with a
-previous union member just like any other field would -- but note that because inline fields can
-have non-power-of-two sizes, such unions can get arbitrarily large, and care should be taken not
-to interleave union field numbers with non-union field numbers due to the problems described in
-the previous paragraph.
+Field offsets are computed by the Cap'n Proto compiler.  The precise algorithm is too complicated
+to describe here, but you need not implement it yourself, as the compiler can produce a compiled
+schema format which includes offset information.
 
 #### Default Values
 
@@ -276,6 +226,33 @@ the target resides, then you will need to allocate a landing pad in some other s
 this double-far approach.  This should be exceedingly rare in practice since pointers are normally
 set to point to new objects, not existing ones.
 
+### Capabilities (Interfaces)
+
+When using Cap'n Proto for [RPC](rpc.html), every message has an associated "capability table"
+which is a flat list of all capabilities present in the message body.  The details of what this
+table contains and where it is stored are the responsibility of the RPC system; in some cases, the
+table may not even be part of the message content.
+
+A capability pointer, then, simply contains an index into the separate capability table.
+
+    lsb                    capability pointer                     msb
+    +-+-----------------------------+-------------------------------+
+    |A|              B              |               C               |
+    +-+-----------------------------+-------------------------------+
+
+    A (2 bits) = 3, to indicate that this is an "other" pointer.
+    B (30 bits) = 0, to indicate that this is a capability pointer.
+        (All other values are reserved for future use.)
+    C (32 bits) = Index of the capability in the message's capability
+        table.
+
+In [rpc.capnp](https://github.com/kentonv/capnproto/blob/master/c++/src/capnp/rpc.capnp), the
+capability table is encoded as a list of `CapDescriptors`, appearing along-side the message content
+in the `Payload` struct.  However, some use cases may call for different approaches.  A message
+that is built and consumed within the same process need not encode the capability table at all
+(it can just keep the table as a separate array).  A message that is going to be stored to disk
+would need to store a table of `SturdyRef`s instead of `CapDescriptor`s.
+
 ## Serialization Over a Stream
 
 When transmitting a message, the segments must be framed in some way, i.e. to communicate the
@@ -316,13 +293,35 @@ In addition to the above, there are two tag values which are treated specially: 
 * 0x00:  The tag is followed by a single byte which indicates a count of consecutive zero-valued
   words, minus 1.  E.g. if the tag 0x00 is followed by 0x05, the sequence unpacks to 6 words of
   zero.
-* 0xff:  The tag is followed by the bytes of the word as described above, but after those bytes is
-  another byte with value N.  Following that byte is N unpacked words that should be copied
+
+  Or, put another way: the tag is first decoded as if it were not special.  Since none of the bits
+  are set, it is followed by no bytes and expands to a word full of zeros.  After that, the next
+  byte is interpreted as a count of _additional_ words that are also all-zero.
+
+* 0xff:  The tag is followed by the bytes of the word (as if it weren't special), but after those
+  bytes is another byte with value N.  Following that byte is N unpacked words that should be copied
   directly.  These unpacked words may or may not contain zeros -- it is up to the compressor to
   decide when to end the unpacked span and return to packing each word.  The purpose of this rule
   is to minimize the impact of packing on data that doesn't contain any zeros -- in particular,
   long text blobs.  Because of this rule, the worst-case space overhead of packing is 2 bytes per
   2 KiB of input (256 words = 2KiB).
+
+Examples:
+
+    unpacked (hex):  00 (x 32 bytes)
+    packed (hex):  00 03
+
+    unpacked (hex):  8a (x 32 bytes)
+    packed (hex):  ff 8a (x 8 bytes) 03 8a (x 24 bytes)
+
+Notice that both of the special cases begin by treating the tag as if it weren't special.  This
+is intentionally designed to make encoding faster:  you can compute the tag value and encode the
+bytes in a single pass through the input word.  Only after you've finished with that word do you
+need to check whether the tag ended up being 0x00 or 0xff.
+
+It is possible to write both an encoder and a decoder which only branch at the end of each word,
+and only to handle the two special tags.  It is not necessary to branch on every byte.  See the
+C++ reference implementation for an example.
 
 Packing is normally applied on top of the standard stream framing described in the previous
 section.

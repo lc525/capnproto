@@ -25,8 +25,6 @@
 //
 // This defines very simple utilities that are widely applicable.
 
-#include <stddef.h>
-
 #ifndef KJ_COMMON_H_
 #define KJ_COMMON_H_
 
@@ -69,6 +67,9 @@
 #endif
 #endif
 
+#include <stddef.h>
+#include <initializer_list>
+
 // =======================================================================================
 
 namespace kj {
@@ -98,6 +99,20 @@ typedef unsigned char byte;
   #endif
 #endif
 
+#if !defined(KJ_DEBUG) && !defined(KJ_NDEBUG)
+// Heuristically decide whether to enable debug mode.  If DEBUG or NDEBUG is defined, use that.
+// Otherwise, fall back to checking whether optimization is enabled.
+#if defined(DEBUG)
+#define KJ_DEBUG
+#elif defined(NDEBUG)
+#define KJ_NDEBUG
+#elif __OPTIMIZE__
+#define KJ_NDEBUG
+#else
+#define KJ_DEBUG
+#endif
+#endif
+
 #define KJ_DISALLOW_COPY(classname) \
   classname(const classname&) = delete; \
   classname& operator=(const classname&) = delete
@@ -109,16 +124,18 @@ typedef unsigned char byte;
 // expect the condition to be true/false enough of the time that it's worth hard-coding branch
 // prediction.
 
-#if defined(NDEBUG) && !__NO_INLINE__
-#define KJ_ALWAYS_INLINE(prototype) inline prototype __attribute__((always_inline))
-// Force a function to always be inlined.  Apply only to the prototype, not to the definition.
-#else
+#if defined(KJ_DEBUG) || __NO_INLINE__
 #define KJ_ALWAYS_INLINE(prototype) inline prototype
 // Don't force inline in debug mode.
+#else
+#define KJ_ALWAYS_INLINE(prototype) inline prototype __attribute__((always_inline))
+// Force a function to always be inlined.  Apply only to the prototype, not to the definition.
 #endif
 
 #define KJ_NORETURN __attribute__((noreturn))
 #define KJ_UNUSED __attribute__((unused))
+
+#define KJ_WARN_UNUSED_RESULT __attribute__((warn_unused_result))
 
 #if __clang__
 #define KJ_UNUSED_MEMBER __attribute__((unused))
@@ -133,19 +150,41 @@ namespace _ {  // private
 void inlineRequireFailure(
     const char* file, int line, const char* expectation, const char* macroArgs,
     const char* message = nullptr) KJ_NORETURN;
+void inlineAssertFailure(
+    const char* file, int line, const char* expectation, const char* macroArgs,
+    const char* message = nullptr) KJ_NORETURN;
+
+void unreachable() KJ_NORETURN;
 
 }  // namespace _ (private)
 
-#ifdef NDEBUG
-#define KJ_IREQUIRE(condition, ...)
-#else
+#ifdef KJ_DEBUG
 #define KJ_IREQUIRE(condition, ...) \
     if (KJ_LIKELY(condition)); else ::kj::_::inlineRequireFailure( \
         __FILE__, __LINE__, #condition, #__VA_ARGS__, ##__VA_ARGS__)
-// Version of KJ_REQUIRE() which is safe to use in headers that are #included by users.  Used to
+// Version of KJ_DREQUIRE() which is safe to use in headers that are #included by users.  Used to
 // check preconditions inside inline methods.  KJ_IREQUIRE is particularly useful in that
 // it will be enabled depending on whether the application is compiled in debug mode rather than
 // whether libkj is.
+
+#define KJ_IASSERT(condition, ...) \
+    if (KJ_LIKELY(condition)); else ::kj::_::inlineAssertFailure( \
+        __FILE__, __LINE__, #condition, #__VA_ARGS__, ##__VA_ARGS__)
+// Version of KJ_DASSERT() which is safe to use in headers that are #included by users.  Used to
+// check state inside inline and templated methods.
+#else
+#define KJ_IREQUIRE(condition, ...)
+#define KJ_IASSERT(condition, ...)
+#endif
+
+#define KJ_UNREACHABLE ::kj::_::unreachable();
+// Put this on code paths that cannot be reached to suppress compiler warnings about missing
+// returns.
+
+#if __clang__
+#define KJ_CLANG_KNOWS_THIS_IS_UNREACHABLE_BUT_GCC_DOESNT
+#else
+#define KJ_CLANG_KNOWS_THIS_IS_UNREACHABLE_BUT_GCC_DOESNT KJ_UNREACHABLE
 #endif
 
 // #define KJ_STACK_ARRAY(type, name, size, minStack, maxStack)
@@ -173,8 +212,6 @@ void inlineRequireFailure(
   ::kj::ArrayPtr<type> name = name##_isOnStack ? \
       kj::arrayPtr(name##_stack, name##_size) : name##_heap
 #endif
-
-#define KJ_ARRAY_SIZE(arr) (sizeof(arr) / sizeof(arr[0]))
 
 #define KJ_CONCAT_(x, y) x##y
 #define KJ_CONCAT(x, y) KJ_CONCAT_(x, y)
@@ -281,6 +318,56 @@ template <typename T> struct IsReference_ { static constexpr bool value = false;
 template <typename T> struct IsReference_<T&> { static constexpr bool value = true; };
 template <typename T> constexpr bool isReference() { return IsReference_<T>::value; }
 
+namespace _ {  // private
+
+template <typename T>
+T refIfLvalue(T&&);
+
+}  // namespace _ (private)
+
+#define KJ_DECLTYPE_REF(exp) decltype(::kj::_::refIfLvalue(exp))
+// Like decltype(exp), but if exp is an lvalue, produces a reference type.
+//
+//     int i;
+//     decltype(i) i1(i);                         // i1 has type int.
+//     KJ_DECLTYPE_REF(i + 1) i2(i + 1);          // i2 has type int.
+//     KJ_DECLTYPE_REF(i) i3(i);                  // i3 has type int&.
+//     KJ_DECLTYPE_REF(kj::mv(i)) i4(kj::mv(i));  // i4 has type int.
+
+template <typename T>
+struct CanConvert_ {
+  static int sfinae(T);
+  static bool sfinae(...);
+};
+
+template <typename T, typename U>
+constexpr bool canConvert() {
+  return sizeof(CanConvert_<U>::sfinae(instance<T>())) == sizeof(int);
+}
+
+#if __clang__
+template <typename T>
+constexpr bool canMemcpy() {
+  // Returns true if T can be copied using memcpy instead of using the copy constructor or
+  // assignment operator.
+
+  // Clang unhelpfully defines __has_trivial_{copy,assign}(T) to be true if the copy constructor /
+  // assign operator are deleted, on the basis that a strict reading of the definition of "trivial"
+  // according to the standard says that deleted functions are in fact trivial.  Meanwhile Clang
+  // provides these admittedly-better intrinsics, but GCC does not.
+  return __is_trivially_constructible(T, const T&) && __is_trivially_assignable(T, const T&);
+}
+#else
+template <typename T>
+constexpr bool canMemcpy() {
+  // Returns true if T can be copied using memcpy instead of using the copy constructor or
+  // assignment operator.
+
+  // GCC defines these to mean what we want them to mean.
+  return __has_trivial_copy(T) && __has_trivial_assign(T);
+}
+#endif
+
 // =======================================================================================
 // Equivalents to std::move() and std::forward(), since these are very commonly needed and the
 // std header <utility> pulls in lots of other stuff.
@@ -292,10 +379,199 @@ template <typename T> constexpr bool isReference() { return IsReference_<T>::val
 template<typename T> constexpr T&& mv(T& t) noexcept { return static_cast<T&&>(t); }
 template<typename T> constexpr T&& fwd(NoInfer<T>& t) noexcept { return static_cast<T&&>(t); }
 
+template<typename T> constexpr T cp(T& t) noexcept { return t; }
+template<typename T> constexpr T cp(const T& t) noexcept { return t; }
+// Useful to force a copy, particularly to pass into a function that expects T&&.
+
 template <typename T, typename U>
 inline constexpr auto min(T&& a, U&& b) -> decltype(a < b ? a : b) { return a < b ? a : b; }
 template <typename T, typename U>
 inline constexpr auto max(T&& a, U&& b) -> decltype(a > b ? a : b) { return a > b ? a : b; }
+
+template <typename T, size_t s>
+inline constexpr size_t size(T (&arr)[s]) { return s; }
+template <typename T>
+inline constexpr size_t size(T&& arr) { return arr.size(); }
+// Returns the size of the parameter, whether the parameter is a regular C array or a container
+// with a `.size()` method.
+
+class MaxValue_ {
+private:
+  template <typename T>
+  inline constexpr T maxSigned() const {
+    return (1ull << (sizeof(T) * 8 - 1)) - 1;
+  }
+  template <typename T>
+  inline constexpr T maxUnsigned() const {
+    return ~static_cast<T>(0u);
+  }
+
+public:
+#define _kJ_HANDLE_TYPE(T) \
+  inline constexpr operator   signed T() const { return MaxValue_::maxSigned  <  signed T>(); } \
+  inline constexpr operator unsigned T() const { return MaxValue_::maxUnsigned<unsigned T>(); }
+  _kJ_HANDLE_TYPE(char)
+  _kJ_HANDLE_TYPE(short)
+  _kJ_HANDLE_TYPE(int)
+  _kJ_HANDLE_TYPE(long)
+  _kJ_HANDLE_TYPE(long long)
+#undef _kJ_HANDLE_TYPE
+};
+
+class MinValue_ {
+private:
+  template <typename T>
+  inline constexpr T minSigned() const {
+    return 1ull << (sizeof(T) * 8 - 1);
+  }
+  template <typename T>
+  inline constexpr T minUnsigned() const {
+    return 0u;
+  }
+
+public:
+#define _kJ_HANDLE_TYPE(T) \
+  inline constexpr operator   signed T() const { return MinValue_::minSigned  <  signed T>(); } \
+  inline constexpr operator unsigned T() const { return MinValue_::minUnsigned<unsigned T>(); }
+  _kJ_HANDLE_TYPE(char)
+  _kJ_HANDLE_TYPE(short)
+  _kJ_HANDLE_TYPE(int)
+  _kJ_HANDLE_TYPE(long)
+  _kJ_HANDLE_TYPE(long long)
+#undef _kJ_HANDLE_TYPE
+};
+
+static constexpr MaxValue_ maxValue = MaxValue_();
+// A special constant which, when cast to an integer type, takes on the maximum possible value of
+// that type.  This is useful to use as e.g. a parameter to a function because it will be robust
+// in the face of changes to the parameter's type.
+//
+// `char` is not supported, but `signed char` and `unsigned char` are.
+
+static constexpr MinValue_ minValue = MinValue_();
+// A special constant which, when cast to an integer type, takes on the minimum possible value
+// of that type.  This is useful to use as e.g. a parameter to a function because it will be robust
+// in the face of changes to the parameter's type.
+//
+// `char` is not supported, but `signed char` and `unsigned char` are.
+
+inline constexpr float inf() { return __builtin_huge_valf(); }
+inline constexpr float nan() { return __builtin_nanf(""); }
+
+// =======================================================================================
+// Useful fake containers
+
+template <typename T>
+class Range {
+public:
+  inline constexpr Range(const T& begin, const T& end): begin_(begin), end_(end) {}
+
+  class Iterator {
+  public:
+    Iterator() = default;
+    inline Iterator(const T& value): value(value) {}
+
+    inline const T&  operator* () const { return value; }
+    inline const T&  operator[](size_t index) const { return value + index; }
+    inline Iterator& operator++() { ++value; return *this; }
+    inline Iterator  operator++(int) { return Iterator(value++); }
+    inline Iterator& operator--() { --value; return *this; }
+    inline Iterator  operator--(int) { return Iterator(value--); }
+    inline Iterator& operator+=(ptrdiff_t amount) { value += amount; return *this; }
+    inline Iterator& operator-=(ptrdiff_t amount) { value -= amount; return *this; }
+    inline Iterator  operator+ (ptrdiff_t amount) const { return Iterator(value + amount); }
+    inline Iterator  operator- (ptrdiff_t amount) const { return Iterator(value - amount); }
+    inline ptrdiff_t operator- (const Iterator& other) const { return value - other.value; }
+
+    inline bool operator==(const Iterator& other) const { return value == other.value; }
+    inline bool operator!=(const Iterator& other) const { return value != other.value; }
+    inline bool operator<=(const Iterator& other) const { return value <= other.value; }
+    inline bool operator>=(const Iterator& other) const { return value >= other.value; }
+    inline bool operator< (const Iterator& other) const { return value <  other.value; }
+    inline bool operator> (const Iterator& other) const { return value >  other.value; }
+
+  private:
+    T value;
+  };
+
+  inline Iterator begin() const { return Iterator(begin_); }
+  inline Iterator end() const { return Iterator(end_); }
+
+  inline auto size() const -> decltype(instance<T>() - instance<T>()) { return end_ - begin_; }
+
+private:
+  T begin_;
+  T end_;
+};
+
+template <typename T>
+inline constexpr Range<Decay<T>> range(T begin, T end) { return Range<Decay<T>>(begin, end); }
+// Returns a fake iterable container containing all values of T from `begin` (inclusive) to `end`
+// (exclusive).  Example:
+//
+//     // Prints 1, 2, 3, 4, 5, 6, 7, 8, 9.
+//     for (int i: kj::range(1, 10)) { print(i); }
+
+template <typename T>
+inline constexpr Range<size_t> indices(T&& container) {
+  // Shortcut for iterating over the indices of a container:
+  //
+  //     for (size_t i: kj::indices(myArray)) { handle(myArray[i]); }
+
+  return range<size_t>(0, kj::size(container));
+}
+
+template <typename T>
+class Repeat {
+public:
+  inline constexpr Repeat(const T& value, size_t count): value(value), count(count) {}
+
+  class Iterator {
+  public:
+    Iterator() = default;
+    inline Iterator(const T& value, size_t index): value(value), index(index) {}
+
+    inline const T&  operator* () const { return value; }
+    inline const T&  operator[](ptrdiff_t index) const { return value; }
+    inline Iterator& operator++() { ++index; return *this; }
+    inline Iterator  operator++(int) { return Iterator(value, index++); }
+    inline Iterator& operator--() { --index; return *this; }
+    inline Iterator  operator--(int) { return Iterator(value, index--); }
+    inline Iterator& operator+=(ptrdiff_t amount) { index += amount; return *this; }
+    inline Iterator& operator-=(ptrdiff_t amount) { index -= amount; return *this; }
+    inline Iterator  operator+ (ptrdiff_t amount) const { return Iterator(value, index + amount); }
+    inline Iterator  operator- (ptrdiff_t amount) const { return Iterator(value, index - amount); }
+    inline ptrdiff_t operator- (const Iterator& other) const { return index - other.index; }
+
+    inline bool operator==(const Iterator& other) const { return index == other.index; }
+    inline bool operator!=(const Iterator& other) const { return index != other.index; }
+    inline bool operator<=(const Iterator& other) const { return index <= other.index; }
+    inline bool operator>=(const Iterator& other) const { return index >= other.index; }
+    inline bool operator< (const Iterator& other) const { return index <  other.index; }
+    inline bool operator> (const Iterator& other) const { return index >  other.index; }
+
+  private:
+    T value;
+    size_t index;
+  };
+
+  inline Iterator begin() const { return Iterator(value, 0); }
+  inline Iterator end() const { return Iterator(value, count); }
+
+  inline size_t size() const { return count; }
+
+private:
+  T value;
+  size_t count;
+};
+
+template <typename T>
+inline constexpr Repeat<Decay<T>> repeat(T&& value, size_t count) {
+  // Returns a fake iterable which contains `count` repeats of `value`.  Useful for e.g. creating
+  // a bunch of spaces:  `kj::repeat(' ', indent * 2)`
+
+  return Repeat<Decay<T>>(value, count);
+}
 
 // =======================================================================================
 // Manually invoking constructors and destructors
@@ -393,6 +669,10 @@ private:  // internal interface used by friends only
       : isSet(true) {
     ctor(value, kj::mv(t));
   }
+  inline NullableValue(T& t)
+      : isSet(true) {
+    ctor(value, t);
+  }
   inline NullableValue(const T& t)
       : isSet(true) {
     ctor(value, t);
@@ -426,12 +706,29 @@ private:  // internal interface used by friends only
 
   inline NullableValue& operator=(NullableValue&& other) {
     if (&other != this) {
+      // Careful about throwing destructors/constructors here.
       if (isSet) {
+        isSet = false;
         dtor(value);
       }
-      isSet = other.isSet;
-      if (isSet) {
+      if (other.isSet) {
         ctor(value, kj::mv(other.value));
+        isSet = true;
+      }
+    }
+    return *this;
+  }
+
+  inline NullableValue& operator=(NullableValue& other) {
+    if (&other != this) {
+      // Careful about throwing destructors/constructors here.
+      if (isSet) {
+        isSet = false;
+        dtor(value);
+      }
+      if (other.isSet) {
+        ctor(value, other.value);
+        isSet = true;
       }
     }
     return *this;
@@ -439,12 +736,14 @@ private:  // internal interface used by friends only
 
   inline NullableValue& operator=(const NullableValue& other) {
     if (&other != this) {
+      // Careful about throwing destructors/constructors here.
       if (isSet) {
+        isSet = false;
         dtor(value);
       }
-      isSet = other.isSet;
-      if (isSet) {
+      if (other.isSet) {
         ctor(value, other.value);
+        isSet = true;
       }
     }
     return *this;
@@ -475,6 +774,10 @@ inline T* readMaybe(Maybe<T&>&& maybe) { return maybe.ptr; }
 template <typename T>
 inline T* readMaybe(const Maybe<T&>& maybe) { return maybe.ptr; }
 
+template <typename T>
+inline T* readMaybe(T* ptr) { return ptr; }
+// Allow KJ_IF_MAYBE to work on regular pointers.
+
 }  // namespace _ (private)
 
 #define KJ_IF_MAYBE(name, exp) if (auto name = ::kj::_::readMaybe(exp))
@@ -488,6 +791,7 @@ class Maybe {
 public:
   Maybe(): ptr(nullptr) {}
   Maybe(T&& t) noexcept(noexcept(T(instance<T&&>()))): ptr(kj::mv(t)) {}
+  Maybe(T& t): ptr(t) {}
   Maybe(const T& t): ptr(t) {}
   Maybe(const T* t) noexcept: ptr(t) {}
   Maybe(Maybe&& other) noexcept(noexcept(T(instance<T&&>()))): ptr(kj::mv(other.ptr)) {}
@@ -509,10 +813,26 @@ public:
   Maybe(decltype(nullptr)) noexcept: ptr(nullptr) {}
 
   inline Maybe& operator=(Maybe&& other) { ptr = kj::mv(other.ptr); return *this; }
+  inline Maybe& operator=(Maybe& other) { ptr = other.ptr; return *this; }
   inline Maybe& operator=(const Maybe& other) { ptr = other.ptr; return *this; }
 
   inline bool operator==(decltype(nullptr)) const { return ptr == nullptr; }
   inline bool operator!=(decltype(nullptr)) const { return ptr != nullptr; }
+
+  T& orDefault(T& defaultValue) {
+    if (ptr == nullptr) {
+      return defaultValue;
+    } else {
+      return *ptr;
+    }
+  }
+  const T& orDefault(const T& defaultValue) const {
+    if (ptr == nullptr) {
+      return defaultValue;
+    } else {
+      return *ptr;
+    }
+  }
 
   template <typename Func>
   auto map(Func&& f) -> Maybe<decltype(f(instance<T&>()))> {
@@ -561,8 +881,8 @@ public:
   inline Maybe(const Maybe<const U&>& other) noexcept: ptr(other.ptr) {}
   inline Maybe(decltype(nullptr)) noexcept: ptr(nullptr) {}
 
-  inline Maybe& operator=(T& other) noexcept { ptr = &other; }
-  inline Maybe& operator=(T* other) noexcept { ptr = other; }
+  inline Maybe& operator=(T& other) noexcept { ptr = &other; return *this; }
+  inline Maybe& operator=(T* other) noexcept { ptr = other; return *this; }
   template <typename U>
   inline Maybe& operator=(Maybe<U&>& other) noexcept { ptr = other.ptr; return *this; }
   template <typename U>
@@ -570,6 +890,21 @@ public:
 
   inline bool operator==(decltype(nullptr)) const { return ptr == nullptr; }
   inline bool operator!=(decltype(nullptr)) const { return ptr != nullptr; }
+
+  T& orDefault(T& defaultValue) {
+    if (ptr == nullptr) {
+      return defaultValue;
+    } else {
+      return *ptr;
+    }
+  }
+  const T& orDefault(const T& defaultValue) const {
+    if (ptr == nullptr) {
+      return defaultValue;
+    } else {
+      return *ptr;
+    }
+  }
 
   template <typename Func>
   auto map(Func&& f) -> Maybe<decltype(f(instance<T&>()))> {
@@ -606,6 +941,12 @@ public:
   inline constexpr ArrayPtr(decltype(nullptr)): ptr(nullptr), size_(0) {}
   inline constexpr ArrayPtr(T* ptr, size_t size): ptr(ptr), size_(size) {}
   inline constexpr ArrayPtr(T* begin, T* end): ptr(begin), size_(end - begin) {}
+  inline constexpr ArrayPtr(std::initializer_list<RemoveConstOrDisable<T>> init)
+      : ptr(init.begin()), size_(init.size()) {}
+
+  template <size_t size>
+  inline constexpr ArrayPtr(T (&native)[size]): ptr(native), size_(size) {}
+  // Construct an ArrayPtr from a native C-style array.
 
   inline operator ArrayPtr<const T>() const {
     return ArrayPtr<const T>(ptr, size_);
@@ -733,7 +1074,7 @@ public:
   KJ_DISALLOW_COPY(Deferred);
 
   // This move constructor is usually optimized away by the compiler.
-  inline Deferred(Deferred&& other): func(kj::mv(other.func)) {
+  inline Deferred(Deferred&& other): func(kj::mv(other.func)), canceled(false) {
     other.canceled = true;
   }
 private:

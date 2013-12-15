@@ -53,16 +53,40 @@ TEST(SchemaLoader, Load) {
   EXPECT_TRUE(testListsSchema.getDependency(typeId<test::TestLists::StructP>()) == structPSchema);
 
   auto struct16Schema = testListsSchema.getDependency(typeId<test::TestLists::Struct16>());
-  EXPECT_EQ(0u, struct16Schema.getProto().getBody().getStructNode().getMembers().size());
+  EXPECT_EQ(0u, struct16Schema.getProto().getStruct().getFields().size());
 }
 
-#if KJ_NO_EXCEPTIONS
-#undef EXPECT_ANY_THROW
-#define EXPECT_ANY_THROW(code) EXPECT_DEATH(code, ".")
-#define EXPECT_NONFATAL_FAILURE(code) code
-#else
-#define EXPECT_NONFATAL_FAILURE EXPECT_ANY_THROW
-#endif
+TEST(SchemaLoader, LoadLateUnion) {
+  SchemaLoader loader;
+
+  StructSchema schema =
+      loader.load(Schema::from<test::TestLateUnion>().getProto()).asStruct();
+  loader.load(Schema::from<test::TestLateUnion::TheUnion>().getProto()).asStruct();
+  loader.load(Schema::from<test::TestLateUnion::AnotherUnion>().getProto()).asStruct();
+
+  EXPECT_EQ(6,
+      schema.getDependency(schema.getFieldByName("theUnion").getProto().getGroup().getTypeId())
+            .asStruct().getFieldByName("grault").getProto().getOrdinal().getExplicit());
+  EXPECT_EQ(9,
+      schema.getDependency(schema.getFieldByName("anotherUnion").getProto().getGroup().getTypeId())
+            .asStruct().getFieldByName("corge").getProto().getOrdinal().getExplicit());
+  EXPECT_TRUE(schema.findFieldByName("corge") == nullptr);
+  EXPECT_TRUE(schema.findFieldByName("grault") == nullptr);
+}
+
+TEST(SchemaLoader, LoadUnnamedUnion) {
+  SchemaLoader loader;
+
+  StructSchema schema =
+      loader.load(Schema::from<test::TestUnnamedUnion>().getProto()).asStruct();
+
+  EXPECT_TRUE(schema.findFieldByName("") == nullptr);
+
+  EXPECT_TRUE(schema.findFieldByName("foo") != nullptr);
+  EXPECT_TRUE(schema.findFieldByName("bar") != nullptr);
+  EXPECT_TRUE(schema.findFieldByName("before") != nullptr);
+  EXPECT_TRUE(schema.findFieldByName("after") != nullptr);
+}
 
 TEST(SchemaLoader, Use) {
   SchemaLoader loader;
@@ -127,12 +151,14 @@ TEST(SchemaLoader, Use) {
 
   // Finally, let's test some unions.
   StructSchema unionSchema = loader.load(Schema::from<TestUnion>().getProto()).asStruct();
+  loader.load(Schema::from<TestUnion::Union0>().getProto());
+  loader.load(Schema::from<TestUnion::Union1>().getProto());
   {
     MallocMessageBuilder builder;
     auto root = builder.getRoot<DynamicStruct>(unionSchema);
 
-    root.get("union0").as<DynamicUnion>().set("u0f1s16", 123);
-    root.get("union1").as<DynamicUnion>().set("u1f0sp", "hello");
+    root.get("union0").as<DynamicStruct>().set("u0f1s16", 123);
+    root.get("union1").as<DynamicStruct>().set("u1f0sp", "hello");
 
     auto reader = builder.getRoot<TestUnion>().asReader();
     EXPECT_EQ(123, reader.getUnion0().getU0f1s16());
@@ -147,15 +173,14 @@ Schema loadUnderAlternateTypeId(SchemaLoader& loader, uint64_t id) {
   auto root = schemaBuilder.getRoot<schema::Node>();
   root.setId(id);
 
-  if (root.getBody().which() == schema::Node::Body::STRUCT_NODE) {
+  if (root.isStruct()) {
     // If the struct contains any self-referential members, change their type IDs as well.
-    auto members = root.getBody().getStructNode().getMembers();
-    for (auto member: members) {
-      if (member.getBody().which() == schema::StructNode::Member::Body::FIELD_MEMBER) {
-        auto type = member.getBody().getFieldMember().getType().getBody();
-        if (type.which() == schema::Type::Body::STRUCT_TYPE &&
-            type.getStructType() == typeId<T>()) {
-          type.setStructType(id);
+    auto fields = root.getStruct().getFields();
+    for (auto field: fields) {
+      if (field.isSlot()) {
+        auto type = field.getSlot().getType();
+        if (type.isStruct() && type.getStruct().getTypeId() == typeId<T>()) {
+          type.getStruct().setTypeId(id);
         }
       }
     }
@@ -207,8 +232,6 @@ TEST(SchemaLoader, Incompatible) {
   EXPECT_NONFATAL_FAILURE(
       loadUnderAlternateTypeId<test::TestAllTypes>(loader, typeId<test::TestListDefaults>()));
 }
-
-// TODO(test):  More extensively test upgrade/downgrade checks.
 
 TEST(SchemaLoader, Enumerate) {
   SchemaLoader loader;

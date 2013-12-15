@@ -33,37 +33,54 @@ namespace {
 
 inline void delay() { usleep(10000); }
 
+#if KJ_NO_EXCEPTIONS
+#undef EXPECT_ANY_THROW
+#define EXPECT_ANY_THROW(code) EXPECT_DEATH(code, ".")
+#define EXPECT_NONFATAL_FAILURE(code) code
+#else
+#define EXPECT_NONFATAL_FAILURE EXPECT_ANY_THROW
+#endif
+
+#ifdef KJ_DEBUG
+#define EXPECT_DEBUG_ANY_THROW EXPECT_ANY_THROW
+#else
+#define EXPECT_DEBUG_ANY_THROW(EXP)
+#endif
+
 TEST(Mutex, MutexGuarded) {
   MutexGuarded<uint> value(123);
 
   {
     Locked<uint> lock = value.lockExclusive();
-    EXPECT_EQ(123, *lock);
+    EXPECT_EQ(123u, *lock);
+    EXPECT_EQ(123u, value.getAlreadyLockedExclusive());
 
     Thread thread([&]() {
       Locked<uint> threadLock = value.lockExclusive();
-      EXPECT_EQ(456, *threadLock);
+      EXPECT_EQ(456u, *threadLock);
       *threadLock = 789;
     });
 
     delay();
-    EXPECT_EQ(123, *lock);
+    EXPECT_EQ(123u, *lock);
     *lock = 456;
     auto earlyRelease = kj::mv(lock);
   }
 
-  EXPECT_EQ(789, *value.lockExclusive());
+  EXPECT_EQ(789u, *value.lockExclusive());
 
   {
     auto rlock1 = value.lockShared();
+    EXPECT_EQ(789u, *rlock1);
+    EXPECT_EQ(789u, value.getAlreadyLockedShared());
 
     {
       auto rlock2 = value.lockShared();
-      EXPECT_EQ(789, *rlock2);
+      EXPECT_EQ(789u, *rlock2);
       auto rlock3 = value.lockShared();
-      EXPECT_EQ(789, *rlock3);
+      EXPECT_EQ(789u, *rlock3);
       auto rlock4 = value.lockShared();
-      EXPECT_EQ(789, *rlock4);
+      EXPECT_EQ(789u, *rlock4);
     }
 
     Thread thread2([&]() {
@@ -80,24 +97,28 @@ TEST(Mutex, MutexGuarded) {
     // but we'll leave this test here until then to make sure we notice the change.
 
     delay();
-    EXPECT_EQ(789, *rlock1);
+    EXPECT_EQ(789u, *rlock1);
 
     {
       auto rlock2 = value.lockShared();
-      EXPECT_EQ(789, *rlock2);
+      EXPECT_EQ(789u, *rlock2);
       auto rlock3 = value.lockShared();
-      EXPECT_EQ(789, *rlock3);
+      EXPECT_EQ(789u, *rlock3);
       auto rlock4 = value.lockShared();
-      EXPECT_EQ(789, *rlock4);
+      EXPECT_EQ(789u, *rlock4);
     }
 #endif
 
     delay();
-    EXPECT_EQ(789, *rlock1);
+    EXPECT_EQ(789u, *rlock1);
     auto earlyRelease = kj::mv(rlock1);
   }
 
-  EXPECT_EQ(321, *value.lockExclusive());
+  EXPECT_EQ(321u, *value.lockExclusive());
+
+  EXPECT_DEBUG_ANY_THROW(value.getAlreadyLockedExclusive());
+  EXPECT_DEBUG_ANY_THROW(value.getAlreadyLockedShared());
+  EXPECT_EQ(321u, value.getWithoutLock());
 }
 
 TEST(Mutex, Lazy) {
@@ -105,7 +126,7 @@ TEST(Mutex, Lazy) {
   bool initStarted = false;
 
   Thread thread([&]() {
-    EXPECT_EQ(123, lazy.get([&](SpaceFor<uint>& space) -> Own<uint> {
+    EXPECT_EQ(123u, lazy.get([&](SpaceFor<uint>& space) -> Own<uint> {
       __atomic_store_n(&initStarted, true, __ATOMIC_RELAXED);
       delay();
       return space.construct(123);
@@ -117,8 +138,32 @@ TEST(Mutex, Lazy) {
     sched_yield();
   }
 
-  EXPECT_EQ(123, lazy.get([](SpaceFor<uint>& space) { return space.construct(456); }));
-  EXPECT_EQ(123, lazy.get([](SpaceFor<uint>& space) { return space.construct(789); }));
+  EXPECT_EQ(123u, lazy.get([](SpaceFor<uint>& space) { return space.construct(456); }));
+  EXPECT_EQ(123u, lazy.get([](SpaceFor<uint>& space) { return space.construct(789); }));
+}
+
+TEST(Mutex, LazyException) {
+  Lazy<uint> lazy;
+
+  auto exception = kj::runCatchingExceptions([&]() {
+    lazy.get([&](SpaceFor<uint>& space) -> Own<uint> {
+          KJ_FAIL_ASSERT("foo") { break; }
+          return space.construct(123);
+        });
+  });
+  EXPECT_TRUE(exception != nullptr);
+
+  uint i = lazy.get([&](SpaceFor<uint>& space) -> Own<uint> {
+        return space.construct(456);
+      });
+
+  // Unfortunately, the results differ depending on whether exceptions are enabled.
+  // TODO(someday):  Fix this?  Does it matter?
+#if KJ_NO_EXCEPTIONS
+  EXPECT_EQ(123, i);
+#else
+  EXPECT_EQ(456, i);
+#endif
 }
 
 }  // namespace

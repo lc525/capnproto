@@ -26,8 +26,7 @@
 #include <kj/mutex.h>
 #include "common.h"
 #include "layout.h"
-
-#include "list.h"  // TODO(cleanup):  For FromReader.  Move elsewhere?
+#include "any.h"
 
 #ifndef CAPNP_MESSAGE_H_
 #define CAPNP_MESSAGE_H_
@@ -40,6 +39,9 @@ namespace _ {  // private
 }
 
 class StructSchema;
+class Orphanage;
+template <typename T>
+class Orphan;
 
 // =======================================================================================
 
@@ -67,7 +69,7 @@ struct ReaderOptions {
   // but probably at least prevents easy exploitation while also avoiding causing problems in most
   // typical cases.
 
-  uint nestingLimit = 64;
+  int nestingLimit = 64;
   // Limits how deeply-nested a message structure can be, e.g. structs containing other structs or
   // lists of structs.
   //
@@ -110,11 +112,21 @@ public:
   typename RootType::Reader getRoot();
   // Get the root struct of the message, interpreting it as the given struct type.
 
-  template <typename RootType>
-  typename RootType::Reader getRoot(StructSchema schema);
-  // Dynamically interpret the root struct of the message using the given schema.
+  template <typename RootType, typename SchemaType>
+  typename RootType::Reader getRoot(SchemaType schema);
+  // Dynamically interpret the root struct of the message using the given schema (a StructSchema).
   // RootType in this case must be DynamicStruct, and you must #include <capnp/dynamic.h> to
   // use this.
+
+  void initCapTable(kj::Array<kj::Maybe<kj::Own<ClientHook>>> capTable);
+  // Sets the table of capabilities embedded in this message.  Capability pointers found in the
+  // message content contain indexes into this table.  You must call this before attempting to
+  // read any capability pointers (interface pointers) from the message.  The table is not passed
+  // to the constructor because often (as in the RPC system) the cap table is actually constructed
+  // based on a list read from the message itself.
+  //
+  // You must link against libcapnp-rpc to call this method (the rest of MessageBuilder is in
+  // regular libcapnp).
 
 private:
   ReaderOptions options;
@@ -123,11 +135,11 @@ private:
   // because we don't want clients to have to #include arena.h, which itself includes a bunch of
   // big STL headers.  We don't use a pointer to a ReaderArena because that would require an
   // extra malloc on every message which could be expensive when processing small messages.
-  void* arenaSpace[15];
+  void* arenaSpace[15 + sizeof(kj::MutexGuarded<void*>) / sizeof(void*)];
   bool allocatedArena;
 
   _::ReaderArena* arena() { return reinterpret_cast<_::ReaderArena*>(arenaSpace); }
-  _::StructReader getRootInternal();
+  AnyPointer::Reader getRootInternal();
 };
 
 class MessageBuilder {
@@ -167,24 +179,35 @@ public:
   typename RootType::Builder getRoot();
   // Get the root struct of the message, interpreting it as the given struct type.
 
-  template <typename RootType>
-  typename RootType::Builder getRoot(StructSchema schema);
-  // Dynamically interpret the root struct of the message using the given schema.
+  template <typename RootType, typename SchemaType>
+  typename RootType::Builder getRoot(SchemaType schema);
+  // Dynamically interpret the root struct of the message using the given schema (a StructSchema).
   // RootType in this case must be DynamicStruct, and you must #include <capnp/dynamic.h> to
   // use this.
 
-  template <typename RootType>
-  typename RootType::Builder initRoot(StructSchema schema);
-  // Dynamically init the root struct of the message using the given schema.
+  template <typename RootType, typename SchemaType>
+  typename RootType::Builder initRoot(SchemaType schema);
+  // Dynamically init the root struct of the message using the given schema (a StructSchema).
   // RootType in this case must be DynamicStruct, and you must #include <capnp/dynamic.h> to
   // use this.
+
+  template <typename T>
+  void adoptRoot(Orphan<T>&& orphan);
+  // Like setRoot() but adopts the orphan without copying.
 
   kj::ArrayPtr<const kj::ArrayPtr<const word>> getSegmentsForOutput();
+  // Get the raw data that makes up the message.
+
+  kj::ArrayPtr<kj::Maybe<kj::Own<ClientHook>>> getCapTable();
+  // Get the table of capabilities (interface pointers) that have been added to this message.
+  // When you later parse this message, you must call `initCapTable()` on the `MessageReader` and
+  // give it an equivalent set of capabilities, otherwise cap pointers in the message will be
+  // unusable.
 
   Orphanage getOrphanage();
 
 private:
-  void* arenaSpace[15 + sizeof(kj::MutexGuarded<void*>) / sizeof(void*)];
+  void* arenaSpace[18];
   // Space in which we can construct a BuilderArena.  We don't use BuilderArena directly here
   // because we don't want clients to have to #include arena.h, which itself includes a bunch of
   // big STL headers.  We don't use a pointer to a BuilderArena because that would require an
@@ -199,9 +222,7 @@ private:
 
   _::BuilderArena* arena() { return reinterpret_cast<_::BuilderArena*>(arenaSpace); }
   _::SegmentBuilder* getRootSegment();
-  _::StructBuilder initRoot(_::StructSize size);
-  void setRootInternal(_::StructReader reader);
-  _::StructBuilder getRoot(_::StructSize size);
+  AnyPointer::Builder getRootInternal();
 };
 
 template <typename RootType>
@@ -234,7 +255,7 @@ template <typename Reader>
 void copyToUnchecked(Reader&& reader, kj::ArrayPtr<word> uncheckedBuffer);
 // Copy the content of the given reader into the given buffer, such that it can safely be passed to
 // readMessageUnchecked().  The buffer's size must be exactly reader.totalSizeInWords() + 1,
-// otherwise an exception will be thrown.
+// otherwise an exception will be thrown.  The buffer must be zero'd before calling.
 
 template <typename Type>
 static typename Type::Reader defaultValue();
@@ -289,7 +310,7 @@ class MallocMessageBuilder: public MessageBuilder {
   // a specific location in memory.
 
 public:
-  explicit MallocMessageBuilder(uint firstSegmentWords = 1024,
+  explicit MallocMessageBuilder(uint firstSegmentWords = SUGGESTED_FIRST_SEGMENT_WORDS,
       AllocationStrategy allocationStrategy = SUGGESTED_ALLOCATION_STRATEGY);
   // Creates a BuilderContext which allocates at least the given number of words for the first
   // segment, and then uses the given strategy to decide how much to allocate for subsequent
@@ -331,8 +352,17 @@ private:
 };
 
 class FlatMessageBuilder: public MessageBuilder {
-  // A message builder implementation which allocates from a single flat array, throwing an
-  // exception if it runs out of space.
+  // THIS IS NOT THE CLASS YOU'RE LOOKING FOR.
+  //
+  // If you want to write a message into already-existing scratch space, use `MallocMessageBuilder`
+  // and pass the scratch space to its constructor.  It will then only fall back to malloc() if
+  // the scratch space is not large enough.
+  //
+  // Do NOT use this class unless you really know what you're doing.  This class is problematic
+  // because it requires advance knowledge of the size of your message, which is usually impossible
+  // to determine without actually building the message.  The class was created primarily to
+  // implement `copyToUnchecked()`, which itself exists only to support other internal parts of
+  // the Cap'n Proto implementation.
 
 public:
   explicit FlatMessageBuilder(kj::ArrayPtr<word> array);
@@ -358,32 +388,47 @@ inline const ReaderOptions& MessageReader::getOptions() {
 
 template <typename RootType>
 inline typename RootType::Reader MessageReader::getRoot() {
-  static_assert(kind<RootType>() == Kind::STRUCT, "Root type must be a Cap'n Proto struct type.");
-  return typename RootType::Reader(getRootInternal());
+  return getRootInternal().getAs<RootType>();
 }
 
 template <typename RootType>
 inline typename RootType::Builder MessageBuilder::initRoot() {
-  static_assert(kind<RootType>() == Kind::STRUCT, "Root type must be a Cap'n Proto struct type.");
-  return typename RootType::Builder(initRoot(_::structSize<RootType>()));
+  return getRootInternal().initAs<RootType>();
 }
 
 template <typename Reader>
 inline void MessageBuilder::setRoot(Reader&& value) {
-  typedef FromReader<Reader> RootType;
-  static_assert(kind<RootType>() == Kind::STRUCT, "Root type must be a Cap'n Proto struct type.");
-  setRootInternal(value._reader);
+  getRootInternal().setAs<FromReader<Reader>>(value);
 }
 
 template <typename RootType>
 inline typename RootType::Builder MessageBuilder::getRoot() {
-  static_assert(kind<RootType>() == Kind::STRUCT, "Root type must be a Cap'n Proto struct type.");
-  return typename RootType::Builder(getRoot(_::structSize<RootType>()));
+  return getRootInternal().getAs<RootType>();
+}
+
+template <typename T>
+void MessageBuilder::adoptRoot(Orphan<T>&& orphan) {
+  return getRootInternal().adopt(kj::mv(orphan));
+}
+
+template <typename RootType, typename SchemaType>
+typename RootType::Reader MessageReader::getRoot(SchemaType schema) {
+  return getRootInternal().getAs<RootType>(schema);
+}
+
+template <typename RootType, typename SchemaType>
+typename RootType::Builder MessageBuilder::getRoot(SchemaType schema) {
+  return getRootInternal().getAs<RootType>(schema);
+}
+
+template <typename RootType, typename SchemaType>
+typename RootType::Builder MessageBuilder::initRoot(SchemaType schema) {
+  return getRootInternal().initAs<RootType>(schema);
 }
 
 template <typename RootType>
 typename RootType::Reader readMessageUnchecked(const word* data) {
-  return typename RootType::Reader(_::StructReader::readRootUnchecked(data));
+  return AnyPointer::Reader(_::PointerReader::getRootUnchecked(data)).getAs<RootType>();
 }
 
 template <typename Reader>
@@ -391,12 +436,6 @@ void copyToUnchecked(Reader&& reader, kj::ArrayPtr<word> uncheckedBuffer) {
   FlatMessageBuilder builder(uncheckedBuffer);
   builder.setRoot(kj::fwd<Reader>(reader));
   builder.requireFilled();
-}
-
-template <typename Type>
-static typename Type::Reader defaultValue() {
-  // TODO(soon):  Correctly handle lists.  Maybe primitives too?
-  return typename Type::Reader(_::StructReader());
 }
 
 }  // namespace capnp

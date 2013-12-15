@@ -35,13 +35,13 @@ namespace {
 class TestPipe: public kj::BufferedInputStream, public kj::OutputStream {
 public:
   TestPipe()
-      : preferredReadSize(std::numeric_limits<size_t>::max()), readPos(0) {}
+      : preferredReadSize(kj::maxValue), readPos(0) {}
   explicit TestPipe(size_t preferredReadSize)
       : preferredReadSize(preferredReadSize), readPos(0) {}
   ~TestPipe() {}
 
   const std::string& getData() { return data; }
-  void resetRead(size_t preferredReadSize = std::numeric_limits<size_t>::max()) {
+  void resetRead(size_t preferredReadSize = kj::maxValue) {
     readPos = 0;
     this->preferredReadSize = preferredReadSize;
   }
@@ -50,7 +50,7 @@ public:
     return readPos == data.size();
   }
 
-  void clear(size_t preferredReadSize = std::numeric_limits<size_t>::max()) {
+  void clear(size_t preferredReadSize = kj::maxValue) {
     resetRead(preferredReadSize);
     data.clear();
   }
@@ -59,7 +59,7 @@ public:
     data.append(reinterpret_cast<const char*>(buffer), size);
   }
 
-  size_t read(void* buffer, size_t minBytes, size_t maxBytes) override {
+  size_t tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
     KJ_ASSERT(maxBytes <= data.size() - readPos, "Overran end of stream.");
     size_t amount = std::min(maxBytes, std::max(minBytes, preferredReadSize));
     memcpy(buffer, data.data() + readPos, amount);
@@ -72,7 +72,7 @@ public:
     readPos += bytes;
   }
 
-  kj::ArrayPtr<const byte> getReadBuffer() override {
+  kj::ArrayPtr<const byte> tryGetReadBuffer() override {
     size_t amount = std::min(data.size() - readPos, preferredReadSize);
     return kj::arrayPtr(reinterpret_cast<const byte*>(data.data() + readPos), amount);
   }

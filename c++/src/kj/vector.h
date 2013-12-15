@@ -82,6 +82,25 @@ public:
     builder.addAll(begin, end);
   }
 
+  template <typename Container>
+  inline void addAll(Container&& container) {
+    addAll(container.begin(), container.end());
+  }
+
+  inline void removeLast() {
+    builder.removeLast();
+  }
+
+  inline void resize(size_t size) {
+    if (size > builder.capacity()) grow(size);
+    while (builder.size() < size) {
+      builder.add(T());
+    }
+    while (builder.size() > size) {
+      builder.removeLast();
+    }
+  }
+
 private:
   ArrayBuilder<T> builder;
 

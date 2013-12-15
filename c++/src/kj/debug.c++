@@ -198,7 +198,7 @@ Debug::Fault::~Fault() noexcept(false) {
   if (exception != nullptr) {
     Exception copy = mv(*exception);
     delete exception;
-    getExceptionCallback().onRecoverableException(mv(copy));
+    throwRecoverableException(mv(copy));
   }
 }
 
@@ -206,7 +206,7 @@ void Debug::Fault::fatal() {
   Exception copy = mv(*exception);
   delete exception;
   exception = nullptr;
-  getExceptionCallback().onFatalException(mv(copy));
+  throwFatalException(mv(copy));
   abort();
 }
 
@@ -222,9 +222,14 @@ String Debug::makeContextDescriptionInternal(const char* macroArgs, ArrayPtr<Str
   return makeDescription(LOG, nullptr, 0, macroArgs, argValues);
 }
 
-int Debug::getOsErrorNumber() {
+int Debug::getOsErrorNumber(bool nonblocking) {
   int result = errno;
-  return result == EINTR ? -1 : result;
+
+  // On many systems, EAGAIN and EWOULDBLOCK have the same value, but this is not strictly required
+  // by POSIX, so we need to check both.
+  return result == EINTR ? -1
+       : nonblocking && (result == EAGAIN || result == EWOULDBLOCK) ? 0
+       : result;
 }
 
 Debug::Context::Context(): logged(false) {}

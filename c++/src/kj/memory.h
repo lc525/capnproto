@@ -81,6 +81,15 @@ public:
 template <typename T>
 const DestructorOnlyDisposer<T> DestructorOnlyDisposer<T>::instance = DestructorOnlyDisposer<T>();
 
+class NullDisposer: public Disposer {
+  // A disposer that does nothing.
+
+public:
+  static const NullDisposer instance;
+
+  void disposeImpl(void* pointer) const override {}
+};
+
 // =======================================================================================
 // Own<T> -- An owned pointer.
 
@@ -107,7 +116,7 @@ public:
       : disposer(other.disposer), ptr(other.ptr) { other.ptr = nullptr; }
   inline Own(Own<RemoveConstOrDisable<T>>&& other) noexcept
       : disposer(other.disposer), ptr(other.ptr) { other.ptr = nullptr; }
-  template <typename U>
+  template <typename U, typename = EnableIf<canConvert<U*, T*>()>>
   inline Own(Own<U>&& other) noexcept
       : disposer(other.disposer), ptr(other.ptr) {
     static_assert(__is_polymorphic(T),
@@ -119,11 +128,39 @@ public:
   ~Own() noexcept(false) { dispose(); }
 
   inline Own& operator=(Own&& other) {
-    dispose();
+    // Move-assingnment operator.
+
+    // Careful, this might own `other`.  Therefore we have to transfer the pointers first, then
+    // dispose.
+    const Disposer* disposerCopy = disposer;
+    T* ptrCopy = ptr;
     disposer = other.disposer;
     ptr = other.ptr;
     other.ptr = nullptr;
+    if (ptrCopy != nullptr) {
+      disposerCopy->dispose(const_cast<RemoveConst<T>*>(ptrCopy));
+    }
     return *this;
+  }
+
+  inline Own& operator=(decltype(nullptr)) {
+    dispose();
+    return *this;
+  }
+
+  template <typename U>
+  Own<U> downcast() {
+    // Downcast the pointer to Own<U>, destroying the original pointer.  If this pointer does not
+    // actually point at an instance of U, the results are undefined (throws an exception in debug
+    // mode if RTTI is enabled, otherwise you're on your own).
+
+    Own<U> result;
+    if (ptr != nullptr) {
+      result.ptr = &kj::downcast<U>(*ptr);
+      result.disposer = disposer;
+      ptr = nullptr;
+    }
+    return result;
   }
 
   inline T* operator->() { return ptr; }
@@ -163,11 +200,27 @@ private:
 namespace _ {  // private
 
 template <typename T>
-Own<T>&& readMaybe(Maybe<Own<T>>&& maybe) { return kj::mv(maybe.ptr); }
+class OwnOwn {
+public:
+  inline OwnOwn(Own<T>&& value) noexcept: value(kj::mv(value)) {}
+
+  inline Own<T>& operator*() { return value; }
+  inline const Own<T>& operator*() const { return value; }
+  inline Own<T>* operator->() { return &value; }
+  inline const Own<T>* operator->() const { return &value; }
+  inline operator Own<T>*() { return value ? &value : nullptr; }
+  inline operator const Own<T>*() const { return value ? &value : nullptr; }
+
+private:
+  Own<T> value;
+};
+
 template <typename T>
-T* readMaybe(Maybe<Own<T>>& maybe) { return maybe.ptr; }
+OwnOwn<T> readMaybe(Maybe<Own<T>>&& maybe) { return OwnOwn<T>(kj::mv(maybe.ptr)); }
 template <typename T>
-const T* readMaybe(const Maybe<Own<T>>& maybe) { return maybe.ptr; }
+Own<T>* readMaybe(Maybe<Own<T>>& maybe) { return maybe.ptr ? &maybe.ptr : nullptr; }
+template <typename T>
+const Own<T>* readMaybe(const Maybe<Own<T>>& maybe) { return maybe.ptr ? &maybe.ptr : nullptr; }
 
 }  // namespace _ (private)
 
@@ -191,21 +244,36 @@ public:
   inline bool operator==(decltype(nullptr)) const { return ptr == nullptr; }
   inline bool operator!=(decltype(nullptr)) const { return ptr != nullptr; }
 
-  template <typename Func>
-  auto map(Func&& f) -> Maybe<decltype(f(instance<T&>()))> {
+  Own<T>& orDefault(Own<T>& defaultValue) {
     if (ptr == nullptr) {
-      return nullptr;
+      return defaultValue;
     } else {
-      return f(*ptr);
+      return ptr;
+    }
+  }
+  const Own<T>& orDefault(const Own<T>& defaultValue) const {
+    if (ptr == nullptr) {
+      return defaultValue;
+    } else {
+      return ptr;
     }
   }
 
   template <typename Func>
-  auto map(Func&& f) const -> Maybe<decltype(f(instance<const T&>()))> {
+  auto map(Func&& f) -> Maybe<decltype(f(instance<Own<T>&>()))> {
     if (ptr == nullptr) {
       return nullptr;
     } else {
-      return f(*ptr);
+      return f(ptr);
+    }
+  }
+
+  template <typename Func>
+  auto map(Func&& f) const -> Maybe<decltype(f(instance<const Own<T>&>()))> {
+    if (ptr == nullptr) {
+      return nullptr;
+    } else {
+      return f(ptr);
     }
   }
 
@@ -218,11 +286,11 @@ private:
   template <typename U>
   friend class Maybe;
   template <typename U>
-  friend Own<U>&& _::readMaybe(Maybe<Own<U>>&& maybe);
+  friend _::OwnOwn<U> _::readMaybe(Maybe<Own<U>>&& maybe);
   template <typename U>
-  friend U* _::readMaybe(Maybe<Own<U>>& maybe);
+  friend Own<U>* _::readMaybe(Maybe<Own<U>>& maybe);
   template <typename U>
-  friend const U* _::readMaybe(const Maybe<Own<U>>& maybe);
+  friend const Own<U>* _::readMaybe(const Maybe<Own<U>>& maybe);
 };
 
 namespace _ {  // private

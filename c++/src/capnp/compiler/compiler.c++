@@ -22,12 +22,14 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "compiler.h"
+#include "parser.h"      // only for generateChildId()
 #include <kj/mutex.h>
 #include <kj/arena.h>
 #include <kj/vector.h>
 #include <kj/debug.h>
 #include <capnp/message.h>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include "node-translator.h"
 #include "md5.h"
@@ -37,15 +39,16 @@ namespace compiler {
 
 class Compiler::Alias {
 public:
-  Alias(const Node& parent, const DeclName::Reader& targetName)
+  Alias(Node& parent, const DeclName::Reader& targetName)
       : parent(parent), targetName(targetName) {}
 
-  kj::Maybe<const Node&> getTarget() const;
+  kj::Maybe<Node&> getTarget();
 
 private:
-  const Node& parent;
+  Node& parent;
   DeclName::Reader targetName;
-  kj::Lazy<kj::Maybe<const Node&>> target;
+  bool initialized = false;
+  kj::Maybe<Node&> target;
 };
 
 class Compiler::Node: public NodeTranslator::Resolver {
@@ -62,39 +65,46 @@ public:
   explicit Node(CompiledModule& module);
   // Create a root node representing the given file.  May
 
-  Node(const Node& parent, const Declaration::Reader& declaration);
+  Node(Node& parent, const Declaration::Reader& declaration);
   // Create a child node.
 
-  Node(kj::StringPtr name, Declaration::Body::Which kind);
+  Node(kj::StringPtr name, Declaration::Which kind);
   // Create a dummy node representing a built-in declaration, like "Int32" or "true".
 
   uint64_t getId() { return id; }
-  Declaration::Body::Which getKind() { return kind; }
+  Declaration::Which getKind() { return kind; }
 
-  kj::Maybe<const Node&> lookupMember(kj::StringPtr name) const;
+  kj::Maybe<Node&> lookupMember(kj::StringPtr name);
   // Find a direct member of this node with the given name.
 
-  kj::Maybe<const Node&> lookupLexical(kj::StringPtr name) const;
+  kj::Maybe<Node&> lookupLexical(kj::StringPtr name);
   // Look up the given name first as a member of this Node, then in its parent, and so on, until
   // it is found or there are no more parents to search.
 
-  kj::Maybe<const Node&> lookup(const DeclName::Reader& name) const;
+  kj::Maybe<Node&> lookup(const DeclName::Reader& name);
   // Resolve an arbitrary DeclName to a Node.
 
-  Schema getBootstrapOrFinalSchema() const;
-  Schema getFinalSchema() const;
+  kj::Maybe<Schema> getBootstrapSchema();
+  kj::Maybe<schema::Node::Reader> getFinalSchema();
+  void loadFinalSchema(const SchemaLoader& loader);
 
-  void addError(kj::StringPtr error) const;
+  void traverse(uint eagerness, std::unordered_map<Node*, uint>& seen,
+                const SchemaLoader& finalLoader);
+  // Get the final schema for this node, and also possibly traverse the node's children and
+  // dependencies to ensure that they are loaded, depending on the mode.
+
+  void addError(kj::StringPtr error);
   // Report an error on this Node.
 
   // implements NodeTranslator::Resolver -----------------------------
-  kj::Maybe<ResolvedName> resolve(const DeclName::Reader& name) const override;
-  Schema resolveMaybeBootstrapSchema(uint64_t id) const override;
-  Schema resolveFinalSchema(uint64_t id) const override;
+  kj::Maybe<ResolvedName> resolve(const DeclName::Reader& name) override;
+  kj::Maybe<Schema> resolveBootstrapSchema(uint64_t id) override;
+  kj::Maybe<schema::Node::Reader> resolveFinalSchema(uint64_t id) override;
+  kj::Maybe<uint64_t> resolveImport(kj::StringPtr name) override;
 
 private:
-  const CompiledModule* module;  // null iff isBuiltin is true
-  kj::Maybe<const Node&> parent;
+  CompiledModule* module;  // null iff isBuiltin is true
+  kj::Maybe<Node&> parent;
 
   Declaration::Reader declaration;
   // AST of the declaration parsed from the schema file.  May become invalid once the content
@@ -108,7 +118,7 @@ private:
   // Fully-qualified display name for this node.  For files, this is just the file name, otherwise
   // it is "filename:Path.To.Decl".
 
-  Declaration::Body::Which kind;
+  Declaration::Which kind;
   // Kind of node.
 
   bool isBuiltin;
@@ -128,41 +138,50 @@ private:
       FINISHED
     };
     State state;
-    // Indicates which fields below are valid.  Must update with atomic-release semantics.
+    // Indicates which fields below are valid.
 
-    inline bool stateHasReached(State minimumState) const {
-      return __atomic_load_n(&state, __ATOMIC_ACQUIRE) >= minimumState;
+    inline bool stateHasReached(State minimumState) {
+      return state >= minimumState;
     }
     inline void advanceState(State newState) {
-      __atomic_store_n(&state, newState, __ATOMIC_RELEASE);
+      state = newState;
     }
 
     // EXPANDED ------------------------------------
 
     typedef std::multimap<kj::StringPtr, kj::Own<Node>> NestedNodesMap;
     NestedNodesMap nestedNodes;
+    kj::Vector<Node*> orderedNestedNodes;
     // Filled in when lookupMember() is first called.  multimap in case of duplicate member names --
     // we still want to compile them, even if it's an error.
 
     typedef std::multimap<kj::StringPtr, kj::Own<Alias>> AliasMap;
     AliasMap aliases;
-    //
+    // The "using" declarations.  These are just links to nodes elsewhere.
 
     // BOOTSTRAP -----------------------------------
 
     NodeTranslator* translator;
     // Node translator, allocated in the bootstrap arena.
 
-    Schema bootstrapSchema;
-    // The schema built in the bootstrap loader.
+    kj::Maybe<Schema> bootstrapSchema;
+    // The schema built in the bootstrap loader.  Null if the bootstrap loader threw an exception.
 
     // FINISHED ------------------------------------
 
-    Schema finalSchema;
-    // The complete schema as loaded by the compiler's main SchemaLoader.
+    kj::Maybe<schema::Node::Reader> finalSchema;
+    // The completed schema, ready to load into the real schema loader.
+
+    kj::Array<schema::Node::Reader> auxSchemas;
+    // Schemas for all auxiliary nodes built by the NodeTranslator.
   };
 
-  kj::MutexGuarded<Content> content;
+  Content guardedContent;     // Read using getContent() only!
+  bool inGetContent = false;  // True while getContent() is running; detects cycles.
+
+  kj::Maybe<schema::Node::Reader> loadedFinalSchema;
+  // Copy of `finalSchema` as loaded into the final schema loader.  This doesn't go away if the
+  // workspace is destroyed.
 
   // ---------------------------------------------
 
@@ -171,42 +190,66 @@ private:
   // Extract the ID from the declaration, or if it has none, generate one based on the name and
   // parent ID.
 
-  static kj::StringPtr joinDisplayName(const kj::Arena& arena, const Node& parent,
-                                       kj::StringPtr declName);
+  static kj::StringPtr joinDisplayName(kj::Arena& arena, Node& parent, kj::StringPtr declName);
   // Join the parent's display name with the child's unqualified name to construct the child's
   // display name.
 
-  const Content& getContent(Content::State minimumState) const;
-  // Advances the content to at least the given state and returns it.  Does not lock if the content
-  // is already at or past the given state.
+  kj::Maybe<Content&> getContent(Content::State minimumState);
+  // Advances the content to at least the given state and returns it.  Returns null if getContent()
+  // is being called recursively and the given state has not yet been reached, as this indicates
+  // that the declaration recursively depends on itself.
+
+  void traverseNodeDependencies(const schema::Node::Reader& schemaNode, uint eagerness,
+                                std::unordered_map<Node*, uint>& seen,
+                                const SchemaLoader& finalLoader);
+  void traverseType(const schema::Type::Reader& type, uint eagerness,
+                    std::unordered_map<Node*, uint>& seen,
+                    const SchemaLoader& finalLoader);
+  void traverseAnnotations(const List<schema::Annotation>::Reader& annotations, uint eagerness,
+                           std::unordered_map<Node*, uint>& seen,
+                           const SchemaLoader& finalLoader);
+  void traverseDependency(uint64_t depId, uint eagerness,
+                          std::unordered_map<Node*, uint>& seen,
+                          const SchemaLoader& finalLoader,
+                          bool ignoreIfNotFound = false);
+  // Helpers for traverse().
 };
 
 class Compiler::CompiledModule {
 public:
-  CompiledModule(const Compiler::Impl& compiler, const Module& parserModule);
+  CompiledModule(Compiler::Impl& compiler, Module& parserModule);
 
-  const Compiler::Impl& getCompiler() const { return compiler; }
+  Compiler::Impl& getCompiler() { return compiler; }
 
-  const ErrorReporter& getErrorReporter() const { return parserModule; }
-  const ParsedFile::Reader& getParsedFile() const { return content; }
-  const Node& getRootNode() const { return rootNode; }
-  kj::StringPtr getSourceName() const { return parserModule.getSourceName(); }
+  ErrorReporter& getErrorReporter() { return parserModule; }
+  ParsedFile::Reader getParsedFile() { return content.getReader(); }
+  Node& getRootNode() { return rootNode; }
+  kj::StringPtr getSourceName() { return parserModule.getSourceName(); }
 
-  kj::Maybe<const CompiledModule&> importRelative(kj::StringPtr importPath) const;
+  kj::Maybe<CompiledModule&> importRelative(kj::StringPtr importPath);
+
+  Orphan<List<schema::CodeGeneratorRequest::RequestedFile::Import>>
+      getFileImportTable(Orphanage orphanage);
 
 private:
-  const Compiler::Impl& compiler;
-  const Module& parserModule;
+  Compiler::Impl& compiler;
+  Module& parserModule;
   MallocMessageBuilder contentArena;
-  ParsedFile::Reader content;
+  Orphan<ParsedFile> content;
   Node rootNode;
 };
 
 class Compiler::Impl: public SchemaLoader::LazyLoadCallback {
 public:
-  Impl();
+  explicit Impl(AnnotationFlag annotationFlag);
+  virtual ~Impl() noexcept(false);
 
-  const CompiledModule& add(const Module& parsedModule) const;
+  uint64_t add(Module& module);
+  kj::Maybe<uint64_t> lookup(uint64_t parent, kj::StringPtr childName);
+  Orphan<List<schema::CodeGeneratorRequest::RequestedFile::Import>>
+      getFileImportTable(Module& module, Orphanage orphanage);
+  void eagerlyCompile(uint64_t id, uint eagerness, const SchemaLoader& loader);
+  CompiledModule& addInternal(Module& parsedModule);
 
   struct Workspace {
     // Scratch space where stuff can be allocated while working.  The Workspace is available
@@ -214,11 +257,14 @@ public:
     // compiler.  Note that since nodes are compiled lazily, a new Workspace may have to be
     // constructed in order to compile more nodes later.
 
-    kj::Arena arena;
-    // Arena for allocating temporary native objects.
-
+    MallocMessageBuilder message;
     Orphanage orphanage;
     // Orphanage for allocating temporary Cap'n Proto objects.
+
+    kj::Arena arena;
+    // Arena for allocating temporary native objects.  Note that objects in `arena` may contain
+    // pointers into `message` that will be manipulated on destruction, so `arena` must be declared
+    // after `message`.
 
     SchemaLoader bootstrapLoader;
     // Loader used to load bootstrap schemas.  The bootstrap schema nodes are similar to the final
@@ -226,64 +272,70 @@ public:
     // default values for struct fields) are left unevaluated (the values in the schema are empty).
     // These bootstrap schemas can then be plugged into the dynamic API and used to evaluate these
     // remaining values.
+
+    inline explicit Workspace(const SchemaLoader::LazyLoadCallback& loaderCallback)
+        : orphanage(message.getOrphanage()),
+          bootstrapLoader(loaderCallback) {}
   };
 
-  const kj::Arena& getNodeArena() const { return nodeArena; }
+  kj::Arena& getNodeArena() { return nodeArena; }
   // Arena where nodes and other permanent objects should be allocated.
 
-  const SchemaLoader& getFinalLoader() const { return finalLoader; }
-  // Schema loader containing final versions of schemas.
-
-  const Workspace& getWorkspace() const { return *workspace.getWithoutLock(); }
+  Workspace& getWorkspace() { return workspace; }
   // Temporary workspace that can be used to construct bootstrap objects.
 
+  inline bool shouldCompileAnnotations() {
+    return annotationFlag == AnnotationFlag::COMPILE_ANNOTATIONS;
+  }
 
-  uint64_t addNode(uint64_t desiredId, Node& node) const;
+  void clearWorkspace();
+  // Reset the temporary workspace.
+
+  uint64_t addNode(uint64_t desiredId, Node& node);
   // Add the given node to the by-ID map under the given ID.  If another node with the same ID
   // already exists, choose a new one arbitrarily and use that instead.  Return the ID that was
   // finally used.
 
-  kj::Maybe<const Node&> findNode(uint64_t id) const;
+  kj::Maybe<Node&> findNode(uint64_t id);
 
-  kj::Maybe<const Node&> lookupBuiltin(kj::StringPtr name) const;
+  kj::Maybe<Node&> lookupBuiltin(kj::StringPtr name);
 
   void load(const SchemaLoader& loader, uint64_t id) const override;
+  // SchemaLoader callback for the bootstrap loader.
+
+  void loadFinal(const SchemaLoader& loader, uint64_t id);
+  // Called from the SchemaLoader callback for the final loader.
 
 private:
+  AnnotationFlag annotationFlag;
+
   kj::Arena nodeArena;
   // Arena used to allocate nodes and other permanent objects.
 
-  SchemaLoader finalLoader;
-  // The loader where we put final output of the compiler.
+  Workspace workspace;
+  // The temporary workspace.
 
-  kj::MutexGuarded<const Workspace*> workspace;
-  // The entry points to the Compiler allocate a Workspace on the stack, lock this mutex, and set
-  // the pointer to point at said stack workspace.  The rest of the compiler can assume that this
-  // Workspace is active.
-
-  uint workspaceRefcount = 0;
-  // Count of threads that have entered the compiler.
-
-  typedef std::unordered_map<Module*, kj::Own<CompiledModule>> ModuleMap;
-  kj::MutexGuarded<ModuleMap> modules;
+  std::unordered_map<Module*, kj::Own<CompiledModule>> modules;
   // Map of parser modules to compiler modules.
 
-  typedef std::unordered_map<uint64_t, const Node*> NodeMap;
-  kj::MutexGuarded<NodeMap> nodesById;
+  std::unordered_map<uint64_t, Node*> nodesById;
   // Map of nodes by ID.
 
   std::map<kj::StringPtr, kj::Own<Node>> builtinDecls;
   // Map of built-in declarations, like "Int32" and "List", which make up the global scope.
 
-  mutable uint64_t nextBogusId = 1000;
+  uint64_t nextBogusId = 1000;
+  // Counter for assigning bogus IDs to nodes whose real ID is a duplicate.
 };
 
 // =======================================================================================
 
-kj::Maybe<const Compiler::Node&> Compiler::Alias::getTarget() const {
-  return target.get([this](kj::SpaceFor<kj::Maybe<const Node&>>& space) {
-    return space.construct(parent.lookup(targetName));
-  });
+kj::Maybe<Compiler::Node&> Compiler::Alias::getTarget() {
+  if (!initialized) {
+    initialized = true;
+    target = parent.lookup(targetName);
+  }
+  return target;
 }
 
 // =======================================================================================
@@ -294,7 +346,7 @@ Compiler::Node::Node(CompiledModule& module)
       declaration(module.getParsedFile().getRoot()),
       id(generateId(0, declaration.getName().getValue(), declaration.getId())),
       displayName(module.getSourceName()),
-      kind(declaration.getBody().which()),
+      kind(declaration.which()),
       isBuiltin(false) {
   auto name = declaration.getName();
   if (name.getValue().size() > 0) {
@@ -308,14 +360,14 @@ Compiler::Node::Node(CompiledModule& module)
   id = module.getCompiler().addNode(id, *this);
 }
 
-Compiler::Node::Node(const Node& parent, const Declaration::Reader& declaration)
+Compiler::Node::Node(Node& parent, const Declaration::Reader& declaration)
     : module(parent.module),
       parent(parent),
       declaration(declaration),
       id(generateId(parent.id, declaration.getName().getValue(), declaration.getId())),
       displayName(joinDisplayName(parent.module->getCompiler().getNodeArena(),
                                   parent, declaration.getName().getValue())),
-      kind(declaration.getBody().which()),
+      kind(declaration.which()),
       isBuiltin(false) {
   auto name = declaration.getName();
   if (name.getValue().size() > 0) {
@@ -329,7 +381,7 @@ Compiler::Node::Node(const Node& parent, const Declaration::Reader& declaration)
   id = module->getCompiler().addNode(id, *this);
 }
 
-Compiler::Node::Node(kj::StringPtr name, Declaration::Body::Which kind)
+Compiler::Node::Node(kj::StringPtr name, Declaration::Which kind)
     : module(nullptr),
       parent(nullptr),
       id(0),
@@ -341,34 +393,15 @@ Compiler::Node::Node(kj::StringPtr name, Declaration::Body::Which kind)
 
 uint64_t Compiler::Node::generateId(uint64_t parentId, kj::StringPtr declName,
                                     Declaration::Id::Reader declId) {
-  if (declId.which() == Declaration::Id::UID) {
+  if (declId.isUid()) {
     return declId.getUid().getValue();
   }
 
-  // No explicit ID.  Compute it by MD5 hashing the concatenation of the parent ID and the
-  // declaration name, and then taking the first 8 bytes.
-
-  kj::byte parentIdBytes[sizeof(uint64_t)];
-  for (uint i = 0; i < sizeof(uint64_t); i++) {
-    parentIdBytes[i] = (parentId >> (i * 8)) & 0xff;
-  }
-
-  Md5 md5;
-  md5.update(kj::arrayPtr(parentIdBytes, KJ_ARRAY_SIZE(parentIdBytes)));
-  md5.update(declName);
-
-  kj::ArrayPtr<const kj::byte> resultBytes = md5.finish();
-
-  uint64_t result = 0;
-  for (uint i = 0; i < sizeof(uint64_t); i++) {
-    result = (result << 8) | resultBytes[i];
-  }
-
-  return result;
+  return generateChildId(parentId, declName);
 }
 
 kj::StringPtr Compiler::Node::joinDisplayName(
-    const kj::Arena& arena, const Node& parent, kj::StringPtr declName) {
+    kj::Arena& arena, Node& parent, kj::StringPtr declName) {
   kj::ArrayPtr<char> result = arena.allocateArray<char>(
       parent.displayName.size() + declName.size() + 2);
 
@@ -377,19 +410,27 @@ kj::StringPtr Compiler::Node::joinDisplayName(
   result[separatorPos] = parent.parent == nullptr ? ':' : '.';
   memcpy(result.begin() + separatorPos + 1, declName.begin(), declName.size());
   result[result.size() - 1] = '\0';
-  return kj::StringPtr(declName.begin(), declName.size() - 1);
+  return kj::StringPtr(result.begin(), result.size() - 1);
 }
 
-const Compiler::Node::Content& Compiler::Node::getContent(Content::State minimumState) const {
+kj::Maybe<Compiler::Node::Content&> Compiler::Node::getContent(Content::State minimumState) {
   KJ_REQUIRE(!isBuiltin, "illegal method call for built-in declaration");
 
-  if (content.getWithoutLock().stateHasReached(minimumState)) {
-    return content.getWithoutLock();
+  auto& content = guardedContent;
+
+  if (content.stateHasReached(minimumState)) {
+    return content;
   }
 
-  auto locked = content.lockExclusive();
+  if (inGetContent) {
+    addError("Declaration recursively depends on itself.");
+    return nullptr;
+  }
 
-  switch (locked->state) {
+  inGetContent = true;
+  KJ_DEFER(inGetContent = false);
+
+  switch (content.state) {
     case Content::STUB: {
       if (minimumState <= Content::STUB) break;
 
@@ -397,33 +438,34 @@ const Compiler::Node::Content& Compiler::Node::getContent(Content::State minimum
       auto& arena = module->getCompiler().getNodeArena();
 
       for (auto nestedDecl: declaration.getNestedDecls()) {
-        switch (nestedDecl.getBody().which()) {
-          case Declaration::Body::FILE_DECL:
-          case Declaration::Body::CONST_DECL:
-          case Declaration::Body::ANNOTATION_DECL:
-          case Declaration::Body::ENUM_DECL:
-          case Declaration::Body::STRUCT_DECL:
-          case Declaration::Body::INTERFACE_DECL: {
+        switch (nestedDecl.which()) {
+          case Declaration::FILE:
+          case Declaration::CONST:
+          case Declaration::ANNOTATION:
+          case Declaration::ENUM:
+          case Declaration::STRUCT:
+          case Declaration::INTERFACE: {
             kj::Own<Node> subNode = arena.allocateOwn<Node>(*this, nestedDecl);
             kj::StringPtr name = nestedDecl.getName().getValue();
-            locked->nestedNodes.insert(std::make_pair(name, kj::mv(subNode)));
+            content.orderedNestedNodes.add(subNode);
+            content.nestedNodes.insert(std::make_pair(name, kj::mv(subNode)));
             break;
           }
 
-          case Declaration::Body::USING_DECL: {
+          case Declaration::USING: {
             kj::Own<Alias> alias = arena.allocateOwn<Alias>(
-                *this, nestedDecl.getBody().getUsingDecl().getTarget());
+                *this, nestedDecl.getUsing().getTarget());
             kj::StringPtr name = nestedDecl.getName().getValue();
-            locked->aliases.insert(std::make_pair(name, kj::mv(alias)));
+            content.aliases.insert(std::make_pair(name, kj::mv(alias)));
             break;
           }
-          case Declaration::Body::ENUMERANT_DECL:
-          case Declaration::Body::FIELD_DECL:
-          case Declaration::Body::UNION_DECL:
-          case Declaration::Body::GROUP_DECL:
-          case Declaration::Body::METHOD_DECL:
-          case Declaration::Body::NAKED_ID:
-          case Declaration::Body::NAKED_ANNOTATION:
+          case Declaration::ENUMERANT:
+          case Declaration::FIELD:
+          case Declaration::UNION:
+          case Declaration::GROUP:
+          case Declaration::METHOD:
+          case Declaration::NAKED_ID:
+          case Declaration::NAKED_ANNOTATION:
             // Not a node.  Skip.
             break;
           default:
@@ -432,7 +474,7 @@ const Compiler::Node::Content& Compiler::Node::getContent(Content::State minimum
         }
       }
 
-      locked->advanceState(Content::EXPANDED);
+      content.advanceState(Content::EXPANDED);
       // no break
     }
 
@@ -450,29 +492,43 @@ const Compiler::Node::Content& Compiler::Node::getContent(Content::State minimum
         builder.setScopeId(p->id);
       }
 
-      auto nestedIter = builder.initNestedNodes(locked->nestedNodes.size()).begin();
-      for (auto& entry: locked->nestedNodes) {
-        nestedIter->setName(entry.first);
-        nestedIter->setId(entry.second->id);
+      auto nestedNodes = builder.initNestedNodes(content.orderedNestedNodes.size());
+      auto nestedIter = nestedNodes.begin();
+      for (auto node: content.orderedNestedNodes) {
+        nestedIter->setName(node->declaration.getName().getValue());
+        nestedIter->setId(node->id);
         ++nestedIter;
       }
 
-      locked->translator = &workspace.arena.allocate<NodeTranslator>(
-          *this, module->getErrorReporter(), declaration, kj::mv(schemaNode));
-      locked->bootstrapSchema = workspace.bootstrapLoader.loadOnce(
-          locked->translator->getBootstrapNode());
+      content.translator = &workspace.arena.allocate<NodeTranslator>(
+          *this, module->getErrorReporter(), declaration, kj::mv(schemaNode),
+          module->getCompiler().shouldCompileAnnotations());
+      KJ_IF_MAYBE(exception, kj::runCatchingExceptions([&](){
+        auto nodeSet = content.translator->getBootstrapNode();
+        for (auto& auxNode: nodeSet.auxNodes) {
+          workspace.bootstrapLoader.loadOnce(auxNode);
+        }
+        content.bootstrapSchema = workspace.bootstrapLoader.loadOnce(nodeSet.node);
+      })) {
+        content.bootstrapSchema = nullptr;
+        // Only bother to report validation failures if we think we haven't seen any errors.
+        // Otherwise we assume that the errors caused the validation failure.
+        if (!module->getErrorReporter().hadErrors()) {
+          addError(kj::str("Internal compiler bug: Bootstrap schema failed validation:\n",
+                           *exception));
+        }
+      }
 
-      // If the Workspace is destroyed while this Node is still in the BOOTSTRAP state,
-      // revert it to the EXPANDED state, because the NodeTranslator is no longer valid in this
-      // case.
-      Content* contentPtr = locked.get();
-      workspace.arena.copy(kj::defer([contentPtr]() {
-        if (contentPtr->state == Content::BOOTSTRAP) {
-          contentPtr->state = Content::EXPANDED;
+      // If the Workspace is destroyed, revert the node to the EXPANDED state, because the
+      // NodeTranslator is no longer valid in this case.
+      workspace.arena.copy(kj::defer([&content]() {
+        content.bootstrapSchema = nullptr;
+        if (content.state > Content::EXPANDED) {
+          content.state = Content::EXPANDED;
         }
       }));
 
-      locked->advanceState(Content::BOOTSTRAP);
+      content.advanceState(Content::BOOTSTRAP);
       // no break
     }
 
@@ -480,10 +536,11 @@ const Compiler::Node::Content& Compiler::Node::getContent(Content::State minimum
       if (minimumState <= Content::BOOTSTRAP) break;
 
       // Create the final schema.
-      locked->finalSchema = module->getCompiler().getFinalLoader().loadOnce(
-          locked->translator->finish());
+      auto nodeSet = content.translator->finish();
+      content.finalSchema = nodeSet.node;
+      content.auxSchemas = kj::mv(nodeSet.auxNodes);
 
-      locked->advanceState(Content::FINISHED);
+      content.advanceState(Content::FINISHED);
       // no break
     }
 
@@ -491,29 +548,30 @@ const Compiler::Node::Content& Compiler::Node::getContent(Content::State minimum
       break;
   }
 
-  return *locked;
+  return content;
 }
 
-kj::Maybe<const Compiler::Node&> Compiler::Node::lookupMember(kj::StringPtr name) const {
+kj::Maybe<Compiler::Node&> Compiler::Node::lookupMember(kj::StringPtr name) {
   if (isBuiltin) return nullptr;
 
-  auto& content = getContent(Content::EXPANDED);
-  {
-    auto iter = content.nestedNodes.find(name);
-    if (iter != content.nestedNodes.end()) {
-      return *iter->second;
+  KJ_IF_MAYBE(content, getContent(Content::EXPANDED)) {
+    {
+      auto iter = content->nestedNodes.find(name);
+      if (iter != content->nestedNodes.end()) {
+        return *iter->second;
+      }
     }
-  }
-  {
-    auto iter = content.aliases.find(name);
-    if (iter != content.aliases.end()) {
-      return iter->second->getTarget();
+    {
+      auto iter = content->aliases.find(name);
+      if (iter != content->aliases.end()) {
+        return iter->second->getTarget();
+      }
     }
   }
   return nullptr;
 }
 
-kj::Maybe<const Compiler::Node&> Compiler::Node::lookupLexical(kj::StringPtr name) const {
+kj::Maybe<Compiler::Node&> Compiler::Node::lookupLexical(kj::StringPtr name) {
   KJ_REQUIRE(!isBuiltin, "illegal method call for built-in declaration");
 
   auto result = lookupMember(name);
@@ -527,10 +585,10 @@ kj::Maybe<const Compiler::Node&> Compiler::Node::lookupLexical(kj::StringPtr nam
   return result;
 }
 
-kj::Maybe<const Compiler::Node&> Compiler::Node::lookup(const DeclName::Reader& name) const {
+kj::Maybe<Compiler::Node&> Compiler::Node::lookup(const DeclName::Reader& name) {
   KJ_REQUIRE(!isBuiltin, "illegal method call for built-in declaration");
 
-  const Node* node = nullptr;
+  Node* node = nullptr;
 
   auto base = name.getBase();
   switch (base.which()) {
@@ -540,7 +598,7 @@ kj::Maybe<const Compiler::Node&> Compiler::Node::lookup(const DeclName::Reader& 
         node = &*n;
       } else {
         module->getErrorReporter().addErrorOn(
-            absoluteName, kj::str("not defined: ", absoluteName.getValue()));
+            absoluteName, kj::str("Not defined: ", absoluteName.getValue()));
         return nullptr;
       }
       break;
@@ -551,7 +609,7 @@ kj::Maybe<const Compiler::Node&> Compiler::Node::lookup(const DeclName::Reader& 
         node = &*n;
       } else {
         module->getErrorReporter().addErrorOn(
-            relativeName, kj::str("not defined: ", relativeName.getValue()));
+            relativeName, kj::str("Not defined: ", relativeName.getValue()));
         return nullptr;
       }
       break;
@@ -562,7 +620,7 @@ kj::Maybe<const Compiler::Node&> Compiler::Node::lookup(const DeclName::Reader& 
         node = &m->getRootNode();
       } else {
         module->getErrorReporter().addErrorOn(
-            importName, kj::str("import failed: ", importName.getValue()));
+            importName, kj::str("Import failed: ", importName.getValue()));
         return nullptr;
       }
       break;
@@ -576,7 +634,7 @@ kj::Maybe<const Compiler::Node&> Compiler::Node::lookup(const DeclName::Reader& 
       node = &*member;
     } else {
       module->getErrorReporter().addErrorOn(
-          partName, kj::str("no such member: ", partName.getValue()));
+          partName, kj::str("No such member: ", partName.getValue()));
       return nullptr;
     }
   }
@@ -584,39 +642,216 @@ kj::Maybe<const Compiler::Node&> Compiler::Node::lookup(const DeclName::Reader& 
   return *node;
 }
 
-Schema Compiler::Node::getBootstrapOrFinalSchema() const {
-  auto& content = getContent(Content::BOOTSTRAP);
-
-  if (__atomic_load_n(&content.state, __ATOMIC_ACQUIRE) == Content::FINISHED) {
-    return content.finalSchema;
+kj::Maybe<Schema> Compiler::Node::getBootstrapSchema() {
+  KJ_IF_MAYBE(schema, loadedFinalSchema) {
+    // We don't need to rebuild the bootstrap schema if we already have a final schema.
+    return module->getCompiler().getWorkspace().bootstrapLoader.loadOnce(*schema);
+  } else KJ_IF_MAYBE(content, getContent(Content::BOOTSTRAP)) {
+    if (content->state == Content::FINISHED && content->bootstrapSchema == nullptr) {
+      // The bootstrap schema was discarded.  Copy it from the final schema.
+      // (We can't just return the final schema because using it could trigger schema loader
+      // callbacks that would deadlock.)
+      KJ_IF_MAYBE(finalSchema, content->finalSchema) {
+        return module->getCompiler().getWorkspace().bootstrapLoader.loadOnce(*finalSchema);
+      } else {
+        return nullptr;
+      }
+    } else {
+      return content->bootstrapSchema;
+    }
   } else {
-    return content.bootstrapSchema;
+    return nullptr;
   }
 }
-Schema Compiler::Node::getFinalSchema() const {
-  return getContent(Content::FINISHED).finalSchema;
+kj::Maybe<schema::Node::Reader> Compiler::Node::getFinalSchema() {
+  KJ_IF_MAYBE(schema, loadedFinalSchema) {
+    return *schema;
+  } else KJ_IF_MAYBE(content, getContent(Content::FINISHED)) {
+    return content->finalSchema;
+  } else {
+    return nullptr;
+  }
+}
+void Compiler::Node::loadFinalSchema(const SchemaLoader& loader) {
+  KJ_IF_MAYBE(content, getContent(Content::FINISHED)) {
+    KJ_IF_MAYBE(exception, kj::runCatchingExceptions([&](){
+      KJ_IF_MAYBE(finalSchema, content->finalSchema) {
+        KJ_MAP(auxSchema, content->auxSchemas) {
+          return loader.loadOnce(auxSchema);
+        };
+        loadedFinalSchema = loader.loadOnce(*finalSchema).getProto();
+      }
+    })) {
+      // Schema validation threw an exception.
+
+      // Don't try loading this again.
+      content->finalSchema = nullptr;
+
+      // Only bother to report validation failures if we think we haven't seen any errors.
+      // Otherwise we assume that the errors caused the validation failure.
+      if (!module->getErrorReporter().hadErrors()) {
+        addError(kj::str("Internal compiler bug: Schema failed validation:\n", *exception));
+      }
+    }
+  }
 }
 
-void Compiler::Node::addError(kj::StringPtr error) const {
+void Compiler::Node::traverse(uint eagerness, std::unordered_map<Node*, uint>& seen,
+                              const SchemaLoader& finalLoader) {
+  uint& slot = seen[this];
+  if ((slot & eagerness) == eagerness) {
+    // We've already covered this node.
+    return;
+  }
+  slot |= eagerness;
+
+  KJ_IF_MAYBE(content, getContent(Content::FINISHED)) {
+    loadFinalSchema(finalLoader);
+
+    KJ_IF_MAYBE(schema, getFinalSchema()) {
+      if (eagerness / DEPENDENCIES != 0) {
+        // For traversing dependencies, discard the bits lower than DEPENDENCIES and replace
+        // them with the bits above DEPENDENCIES shifted over.
+        uint newEagerness = (eagerness & ~(DEPENDENCIES - 1)) | (eagerness / DEPENDENCIES);
+
+        traverseNodeDependencies(*schema, newEagerness, seen, finalLoader);
+        for (auto& aux: content->auxSchemas) {
+          traverseNodeDependencies(aux, newEagerness, seen, finalLoader);
+        }
+      }
+    }
+  }
+
+  if (eagerness & PARENTS) {
+    KJ_IF_MAYBE(p, parent) {
+      p->traverse(eagerness, seen, finalLoader);
+    }
+  }
+
+  if (eagerness & CHILDREN) {
+    KJ_IF_MAYBE(content, getContent(Content::EXPANDED)) {
+      for (auto& child: content->orderedNestedNodes) {
+        child->traverse(eagerness, seen, finalLoader);
+      }
+    }
+  }
+}
+
+void Compiler::Node::traverseNodeDependencies(
+    const schema::Node::Reader& schemaNode, uint eagerness,
+    std::unordered_map<Node*, uint>& seen,
+    const SchemaLoader& finalLoader) {
+  switch (schemaNode.which()) {
+    case schema::Node::STRUCT:
+      for (auto field: schemaNode.getStruct().getFields()) {
+        switch (field.which()) {
+          case schema::Field::SLOT:
+            traverseType(field.getSlot().getType(), eagerness, seen, finalLoader);
+            break;
+          case schema::Field::GROUP:
+            // Aux node will be scanned later.
+            break;
+        }
+
+        traverseAnnotations(field.getAnnotations(), eagerness, seen, finalLoader);
+      }
+      break;
+
+    case schema::Node::ENUM:
+      for (auto enumerant: schemaNode.getEnum().getEnumerants()) {
+        traverseAnnotations(enumerant.getAnnotations(), eagerness, seen, finalLoader);
+      }
+      break;
+
+    case schema::Node::INTERFACE: {
+      auto interface = schemaNode.getInterface();
+      for (auto extend: interface.getExtends()) {
+        if (extend != 0) {  // if zero, we reported an error earlier
+          traverseDependency(extend, eagerness, seen, finalLoader);
+        }
+      }
+      for (auto method: interface.getMethods()) {
+        traverseDependency(method.getParamStructType(), eagerness, seen, finalLoader, true);
+        traverseDependency(method.getResultStructType(), eagerness, seen, finalLoader, true);
+        traverseAnnotations(method.getAnnotations(), eagerness, seen, finalLoader);
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+
+  traverseAnnotations(schemaNode.getAnnotations(), eagerness, seen, finalLoader);
+}
+
+void Compiler::Node::traverseType(const schema::Type::Reader& type, uint eagerness,
+                                  std::unordered_map<Node*, uint>& seen,
+                                  const SchemaLoader& finalLoader) {
+  uint64_t id = 0;
+  switch (type.which()) {
+    case schema::Type::STRUCT:
+      id = type.getStruct().getTypeId();
+      break;
+    case schema::Type::ENUM:
+      id = type.getEnum().getTypeId();
+      break;
+    case schema::Type::INTERFACE:
+      id = type.getInterface().getTypeId();
+      break;
+    case schema::Type::LIST:
+      traverseType(type.getList().getElementType(), eagerness, seen, finalLoader);
+      return;
+    default:
+      return;
+  }
+
+  traverseDependency(id, eagerness, seen, finalLoader);
+}
+
+void Compiler::Node::traverseDependency(uint64_t depId, uint eagerness,
+                                        std::unordered_map<Node*, uint>& seen,
+                                        const SchemaLoader& finalLoader,
+                                        bool ignoreIfNotFound) {
+  KJ_IF_MAYBE(node, module->getCompiler().findNode(depId)) {
+    node->traverse(eagerness, seen, finalLoader);
+  } else if (!ignoreIfNotFound) {
+    KJ_FAIL_ASSERT("Dependency ID not present in compiler?", depId);
+  }
+}
+
+void Compiler::Node::traverseAnnotations(const List<schema::Annotation>::Reader& annotations,
+                                         uint eagerness,
+                                         std::unordered_map<Node*, uint>& seen,
+                                         const SchemaLoader& finalLoader) {
+  for (auto annotation: annotations) {
+    KJ_IF_MAYBE(node, module->getCompiler().findNode(annotation.getId())) {
+      node->traverse(eagerness, seen, finalLoader);
+    }
+  }
+}
+
+
+void Compiler::Node::addError(kj::StringPtr error) {
   module->getErrorReporter().addError(startByte, endByte, error);
 }
 
 kj::Maybe<NodeTranslator::Resolver::ResolvedName> Compiler::Node::resolve(
-    const DeclName::Reader& name) const {
-  return lookup(name).map([](const Node& node) {
+    const DeclName::Reader& name) {
+  return lookup(name).map([](Node& node) {
     return ResolvedName { node.id, node.kind };
   });
 }
 
-Schema Compiler::Node::resolveMaybeBootstrapSchema(uint64_t id) const {
+kj::Maybe<Schema> Compiler::Node::resolveBootstrapSchema(uint64_t id) {
   KJ_IF_MAYBE(node, module->getCompiler().findNode(id)) {
-    return node->getBootstrapOrFinalSchema();
+    return node->getBootstrapSchema();
   } else {
     KJ_FAIL_REQUIRE("Tried to get schema for ID we haven't seen before.");
   }
 }
 
-Schema Compiler::Node::resolveFinalSchema(uint64_t id) const {
+kj::Maybe<schema::Node::Reader> Compiler::Node::resolveFinalSchema(uint64_t id) {
   KJ_IF_MAYBE(node, module->getCompiler().findNode(id)) {
     return node->getFinalSchema();
   } else {
@@ -624,43 +859,162 @@ Schema Compiler::Node::resolveFinalSchema(uint64_t id) const {
   }
 }
 
+kj::Maybe<uint64_t> Compiler::Node::resolveImport(kj::StringPtr name) {
+  KJ_IF_MAYBE(m, module->importRelative(name)) {
+    return m->getRootNode().getId();
+  } else {
+    return nullptr;
+  }
+}
+
 // =======================================================================================
 
-Compiler::CompiledModule::CompiledModule(
-    const Compiler::Impl& compiler, const Module& parserModule)
+Compiler::CompiledModule::CompiledModule(Compiler::Impl& compiler, Module& parserModule)
     : compiler(compiler), parserModule(parserModule),
       content(parserModule.loadContent(contentArena.getOrphanage())),
       rootNode(*this) {}
 
-kj::Maybe<const Compiler::CompiledModule&> Compiler::CompiledModule::importRelative(
-    kj::StringPtr importPath) const {
+kj::Maybe<Compiler::CompiledModule&> Compiler::CompiledModule::importRelative(
+    kj::StringPtr importPath) {
   return parserModule.importRelative(importPath).map(
-      [this](const Module& module) -> const Compiler::CompiledModule& {
-        return compiler.add(module);
+      [this](Module& module) -> Compiler::CompiledModule& {
+        return compiler.addInternal(module);
       });
+}
+
+static void findImports(DeclName::Reader name, std::set<kj::StringPtr>& output) {
+  if (name.getBase().isImportName()) {
+    output.insert(name.getBase().getImportName().getValue());
+  }
+}
+
+static void findImports(TypeExpression::Reader type, std::set<kj::StringPtr>& output) {
+  findImports(type.getName(), output);
+  for (auto param: type.getParams()) {
+    findImports(param, output);
+  }
+}
+
+static void findImports(Declaration::Reader decl, std::set<kj::StringPtr>& output) {
+  switch (decl.which()) {
+    case Declaration::USING:
+      findImports(decl.getUsing().getTarget(), output);
+      break;
+    case Declaration::CONST:
+      findImports(decl.getConst().getType(), output);
+      break;
+    case Declaration::FIELD:
+      findImports(decl.getField().getType(), output);
+      break;
+    case Declaration::INTERFACE:
+      for (auto extend: decl.getInterface().getExtends()) {
+        findImports(extend, output);
+      }
+      break;
+    case Declaration::METHOD: {
+      auto method = decl.getMethod();
+
+      auto params = method.getParams();
+      if (params.isNamedList()) {
+        for (auto param: params.getNamedList()) {
+          findImports(param.getType(), output);
+          for (auto ann: param.getAnnotations()) {
+            findImports(ann.getName(), output);
+          }
+        }
+      } else {
+        findImports(params.getType(), output);
+      }
+
+      if (method.getResults().isExplicit()) {
+        auto results = method.getResults().getExplicit();
+        if (results.isNamedList()) {
+          for (auto param: results.getNamedList()) {
+            findImports(param.getType(), output);
+            for (auto ann: param.getAnnotations()) {
+              findImports(ann.getName(), output);
+            }
+          }
+        } else {
+          findImports(results.getType(), output);
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+
+  for (auto ann: decl.getAnnotations()) {
+    findImports(ann.getName(), output);
+  }
+
+  for (auto nested: decl.getNestedDecls()) {
+    findImports(nested, output);
+  }
+}
+
+Orphan<List<schema::CodeGeneratorRequest::RequestedFile::Import>>
+    Compiler::CompiledModule::getFileImportTable(Orphanage orphanage) {
+  std::set<kj::StringPtr> importNames;
+  findImports(content.getReader().getRoot(), importNames);
+
+  auto result = orphanage.newOrphan<List<schema::CodeGeneratorRequest::RequestedFile::Import>>(
+      importNames.size());
+  auto builder = result.get();
+
+  uint i = 0;
+  for (auto name: importNames) {
+    // We presumably ran this import before, so it shouldn't throw now.
+    auto entry = builder[i++];
+    entry.setId(KJ_ASSERT_NONNULL(importRelative(name)).rootNode.getId());
+    entry.setName(name);
+  }
+
+  return result;
 }
 
 // =======================================================================================
 
-Compiler::Impl::Impl(): finalLoader(*this), workspace(nullptr) {
+Compiler::Impl::Impl(AnnotationFlag annotationFlag)
+    : annotationFlag(annotationFlag), workspace(*this) {
   // Reflectively interpret the members of Declaration.body.  Any member prefixed by "builtin"
   // defines a builtin declaration visible in the global scope.
-  StructSchema::Union declBodySchema =
-      Schema::from<Declaration>().getMemberByName("body").asUnion();
-  for (auto member: declBodySchema.getMembers()) {
-    auto name = member.getProto().getName();
-    if (name.startsWith("builtin")) {
-      kj::StringPtr symbolName = name.slice(strlen("builtin"));
-      builtinDecls[symbolName] = nodeArena.allocateOwn<Node>(
-          symbolName, static_cast<Declaration::Body::Which>(member.getIndex()));
+
+  StructSchema declSchema = Schema::from<Declaration>();
+  for (auto field: declSchema.getFields()) {
+    auto fieldProto = field.getProto();
+    if (fieldProto.getDiscriminantValue() != schema::Field::NO_DISCRIMINANT) {
+      auto name = fieldProto.getName();
+      if (name.startsWith("builtin")) {
+        kj::StringPtr symbolName = name.slice(strlen("builtin"));
+        builtinDecls[symbolName] = nodeArena.allocateOwn<Node>(
+            symbolName, static_cast<Declaration::Which>(fieldProto.getDiscriminantValue()));
+      }
     }
   }
 }
 
-uint64_t Compiler::Impl::addNode(uint64_t desiredId, Node& node) const {
-  auto lock = nodesById.lockExclusive();
+Compiler::Impl::~Impl() noexcept(false) {}
+
+void Compiler::Impl::clearWorkspace() {
+  // Make sure we reconstruct the workspace even if destroying it throws an exception.
+  KJ_DEFER(kj::ctor(workspace, *this));
+  kj::dtor(workspace);
+}
+
+Compiler::CompiledModule& Compiler::Impl::addInternal(Module& parsedModule) {
+  kj::Own<CompiledModule>& slot = modules[&parsedModule];
+  if (slot.get() == nullptr) {
+    slot = kj::heap<CompiledModule>(*this, parsedModule);
+  }
+
+  return *slot;
+}
+
+uint64_t Compiler::Impl::addNode(uint64_t desiredId, Node& node) {
   for (;;) {
-    auto insertResult = lock->insert(std::make_pair(desiredId, &node));
+    auto insertResult = nodesById.insert(std::make_pair(desiredId, &node));
     if (insertResult.second) {
       return desiredId;
     }
@@ -675,21 +1029,20 @@ uint64_t Compiler::Impl::addNode(uint64_t desiredId, Node& node) const {
     }
 
     // Assign a new bogus ID.
-    desiredId = __atomic_fetch_add(&nextBogusId, 1, __ATOMIC_RELAXED);
+    desiredId = nextBogusId++;
   }
 }
 
-kj::Maybe<const Compiler::Node&> Compiler::Impl::findNode(uint64_t id) const {
-  auto lock = nodesById.lockShared();
-  auto iter = lock->find(id);
-  if (iter == lock->end()) {
+kj::Maybe<Compiler::Node&> Compiler::Impl::findNode(uint64_t id) {
+  auto iter = nodesById.find(id);
+  if (iter == nodesById.end()) {
     return nullptr;
   } else {
     return *iter->second;
   }
 }
 
-kj::Maybe<const Compiler::Node&> Compiler::Impl::lookupBuiltin(kj::StringPtr name) const {
+kj::Maybe<Compiler::Node&> Compiler::Impl::lookupBuiltin(kj::StringPtr name) {
   auto iter = builtinDecls.find(name);
   if (iter == builtinDecls.end()) {
     return nullptr;
@@ -698,19 +1051,84 @@ kj::Maybe<const Compiler::Node&> Compiler::Impl::lookupBuiltin(kj::StringPtr nam
   }
 }
 
-void Compiler::Impl::load(const SchemaLoader& loader, uint64_t id) const {
-  KJ_IF_MAYBE(node, findNode(id)) {
-    if (&loader == &finalLoader) {
-      Workspace workspace;
-      auto lock = this->workspace.lockExclusive();
-      *lock = &workspace;
-      KJ_DEFER(*lock = nullptr);
-      node->getFinalSchema();
+uint64_t Compiler::Impl::add(Module& module) {
+  return addInternal(module).getRootNode().getId();
+}
+
+kj::Maybe<uint64_t> Compiler::Impl::lookup(uint64_t parent, kj::StringPtr childName) {
+  // Looking up members does not use the workspace, so we don't need to lock it.
+  KJ_IF_MAYBE(parentNode, findNode(parent)) {
+    KJ_IF_MAYBE(child, parentNode->lookupMember(childName)) {
+      return child->getId();
     } else {
-      // Must be the bootstrap loader.
-      node->getBootstrapOrFinalSchema();
+      return nullptr;
     }
+  } else {
+    KJ_FAIL_REQUIRE("lookup()s parameter 'parent' must be a known ID.", parent);
   }
+}
+
+Orphan<List<schema::CodeGeneratorRequest::RequestedFile::Import>>
+    Compiler::Impl::getFileImportTable(Module& module, Orphanage orphanage) {
+  return addInternal(module).getFileImportTable(orphanage);
+}
+
+void Compiler::Impl::eagerlyCompile(uint64_t id, uint eagerness,
+                                    const SchemaLoader& finalLoader) {
+  KJ_IF_MAYBE(node, findNode(id)) {
+    std::unordered_map<Node*, uint> seen;
+    node->traverse(eagerness, seen, finalLoader);
+  } else {
+    KJ_FAIL_REQUIRE("id did not come from this Compiler.", id);
+  }
+}
+
+void Compiler::Impl::load(const SchemaLoader& loader, uint64_t id) const {
+  // We know that this load() is only called from the bootstrap loader which is already protected
+  // by our mutex, so we can drop thread-safety.
+  auto& self = const_cast<Compiler::Impl&>(*this);
+
+  KJ_IF_MAYBE(node, self.findNode(id)) {
+    node->getBootstrapSchema();
+  }
+}
+
+void Compiler::Impl::loadFinal(const SchemaLoader& loader, uint64_t id) {
+  KJ_IF_MAYBE(node, findNode(id)) {
+    node->loadFinalSchema(loader);
+  }
+}
+
+// =======================================================================================
+
+Compiler::Compiler(AnnotationFlag annotationFlag)
+    : impl(kj::heap<Impl>(annotationFlag)),
+      loader(*this) {}
+Compiler::~Compiler() noexcept(false) {}
+
+uint64_t Compiler::add(Module& module) const {
+  return impl.lockExclusive()->get()->add(module);
+}
+
+kj::Maybe<uint64_t> Compiler::lookup(uint64_t parent, kj::StringPtr childName) const {
+  return impl.lockExclusive()->get()->lookup(parent, childName);
+}
+
+Orphan<List<schema::CodeGeneratorRequest::RequestedFile::Import>>
+    Compiler::getFileImportTable(Module& module, Orphanage orphanage) const {
+  return impl.lockExclusive()->get()->getFileImportTable(module, orphanage);
+}
+
+void Compiler::eagerlyCompile(uint64_t id, uint eagerness) const {
+  impl.lockExclusive()->get()->eagerlyCompile(id, eagerness, loader);
+}
+
+void Compiler::clearWorkspace() const {
+  impl.lockExclusive()->get()->clearWorkspace();
+}
+
+void Compiler::load(const SchemaLoader& loader, uint64_t id) const {
+  impl.lockExclusive()->get()->loadFinal(loader, id);
 }
 
 }  // namespace compiler

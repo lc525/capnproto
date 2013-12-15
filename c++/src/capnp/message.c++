@@ -25,6 +25,7 @@
 #include "message.h"
 #include <kj/debug.h>
 #include "arena.h"
+#include "orphan.h"
 #include <stdlib.h>
 #include <exception>
 #include <string>
@@ -41,7 +42,7 @@ MessageReader::~MessageReader() noexcept(false) {
   }
 }
 
-_::StructReader MessageReader::getRootInternal() {
+AnyPointer::Reader MessageReader::getRootInternal() {
   if (!allocatedArena) {
     static_assert(sizeof(_::ReaderArena) <= sizeof(arenaSpace),
         "arenaSpace is too small to hold a ReaderArena.  Please increase it.  This will break "
@@ -54,10 +55,11 @@ _::StructReader MessageReader::getRootInternal() {
   KJ_REQUIRE(segment != nullptr &&
              segment->containsInterval(segment->getStartPtr(), segment->getStartPtr() + 1),
              "Message did not contain a root pointer.") {
-    return _::StructReader();
+    return AnyPointer::Reader();
   }
 
-  return _::StructReader::readRoot(segment->getStartPtr(), segment, options.nestingLimit);
+  return AnyPointer::Reader(_::PointerReader::getRoot(
+      segment, segment->getStartPtr(), options.nestingLimit));
 }
 
 // -------------------------------------------------------------------
@@ -88,27 +90,23 @@ _::SegmentBuilder* MessageBuilder::getRootSegment() {
   }
 }
 
-_::StructBuilder MessageBuilder::initRoot(_::StructSize size) {
+AnyPointer::Builder MessageBuilder::getRootInternal() {
   _::SegmentBuilder* rootSegment = getRootSegment();
-  return _::StructBuilder::initRoot(
-      rootSegment, rootSegment->getPtrUnchecked(0 * WORDS), size);
-}
-
-void MessageBuilder::setRootInternal(_::StructReader reader) {
-  _::SegmentBuilder* rootSegment = getRootSegment();
-  _::StructBuilder::setRoot(
-      rootSegment, rootSegment->getPtrUnchecked(0 * WORDS), reader);
-}
-
-_::StructBuilder MessageBuilder::getRoot(_::StructSize size) {
-  _::SegmentBuilder* rootSegment = getRootSegment();
-  return _::StructBuilder::getRoot(
-      rootSegment, rootSegment->getPtrUnchecked(0 * WORDS), size);
+  return AnyPointer::Builder(_::PointerBuilder::getRoot(
+      rootSegment, rootSegment->getPtrUnchecked(0 * WORDS)));
 }
 
 kj::ArrayPtr<const kj::ArrayPtr<const word>> MessageBuilder::getSegmentsForOutput() {
   if (allocatedArena) {
     return arena()->getSegmentsForOutput();
+  } else {
+    return nullptr;
+  }
+}
+
+kj::ArrayPtr<kj::Maybe<kj::Own<ClientHook>>> MessageBuilder::getCapTable() {
+  if (allocatedArena) {
+    return arena()->getCapTable();
   } else {
     return nullptr;
   }
@@ -175,7 +173,7 @@ MallocMessageBuilder::~MallocMessageBuilder() noexcept(false) {
     }
 
     KJ_IF_MAYBE(s, moreSegments) {
-      for (void* ptr: s->segments) {
+      for (void* ptr: s->get()->segments) {
         free(ptr);
       }
     }
@@ -211,7 +209,7 @@ kj::ArrayPtr<word> MallocMessageBuilder::allocateSegment(uint minimumSize) {
   } else {
     MoreSegments* segments;
     KJ_IF_MAYBE(s, moreSegments) {
-      segments = s;
+      segments = *s;
     } else {
       auto newSegments = kj::heap<MoreSegments>();
       segments = newSegments;

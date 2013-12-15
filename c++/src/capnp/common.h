@@ -33,13 +33,26 @@
 
 namespace capnp {
 
+#define CAPNP_VERSION_MAJOR 0
+#define CAPNP_VERSION_MINOR 5
+#define CAPNP_VERSION_MICRO 0
+
+#define CAPNP_VERSION \
+  (CAPNP_VERSION_MAJOR * 1000000 + CAPNP_VERSION_MINOR * 1000 + CAPNP_VERSION_MICRO)
+
 typedef unsigned int uint;
 
-enum class Void {
-  // Type used for Void fields.  There is only one value.  Using C++'s "void" type creates a bunch
-  // of issues since it behaves differently from other types.
-  VOID
+struct Void {
+  // Type used for Void fields.  Using C++'s "void" type creates a bunch of issues since it behaves
+  // differently from other types.
+
+  inline constexpr bool operator==(Void other) const { return true; }
+  inline constexpr bool operator!=(Void other) const { return false; }
 };
+
+static constexpr Void VOID = Void();
+// Constant value for `Void`,  which is an empty struct.
+
 template <typename T>
 inline T& operator<<(T& os, Void) { return os << "void"; }
 
@@ -86,21 +99,45 @@ inline constexpr Kind kind() {
 template <typename T, Kind k = kind<T>()>
 struct List;
 
+template <typename T> struct ListElementType_;
+template <typename T> struct ListElementType_<List<T>> { typedef T Type; };
+template <typename T> using ListElementType = typename ListElementType_<T>::Type;
+
 namespace _ {  // private
 template <typename T, Kind k> struct Kind_<List<T, k>> { static constexpr Kind kind = Kind::LIST; };
+}  // namespace _ (private)
+
+struct Capability {
+  // A capability without type-safe methods.  Typed capability clients wrap `Client` and typed
+  // capability servers subclass `Server` to dispatch to the regular, typed methods.
+  //
+  // Contents defined in capability.h.  Declared here just so we can specialize Kind_.
+
+  class Client;
+  class Server;
+};
+
+namespace _ {  // private
+template <> struct Kind_<Capability> { static constexpr Kind kind = Kind::INTERFACE; };
 }  // namespace _ (private)
 
 template <typename T, Kind k = kind<T>()> struct ReaderFor_ { typedef typename T::Reader Type; };
 template <typename T> struct ReaderFor_<T, Kind::PRIMITIVE> { typedef T Type; };
 template <typename T> struct ReaderFor_<T, Kind::ENUM> { typedef T Type; };
+template <typename T> struct ReaderFor_<T, Kind::INTERFACE> { typedef typename T::Client Type; };
 template <typename T> using ReaderFor = typename ReaderFor_<T>::Type;
 // The type returned by List<T>::Reader::operator[].
 
 template <typename T, Kind k = kind<T>()> struct BuilderFor_ { typedef typename T::Builder Type; };
 template <typename T> struct BuilderFor_<T, Kind::PRIMITIVE> { typedef T Type; };
 template <typename T> struct BuilderFor_<T, Kind::ENUM> { typedef T Type; };
+template <typename T> struct BuilderFor_<T, Kind::INTERFACE> { typedef typename T::Client Type; };
 template <typename T> using BuilderFor = typename BuilderFor_<T>::Type;
 // The type returned by List<T>::Builder::operator[].
+
+template <typename T, Kind k = kind<T>()> struct PipelineFor_ { typedef typename T::Pipeline Type;};
+template <typename T> struct PipelineFor_<T, Kind::INTERFACE> { typedef typename T::Client Type; };
+template <typename T> using PipelineFor = typename PipelineFor_<T>::Type;
 
 template <typename T, Kind k = kind<T>()> struct TypeIfEnum_;
 template <typename T> struct TypeIfEnum_<T, Kind::ENUM> { typedef T Type; };
@@ -116,10 +153,24 @@ template <typename T>
 using FromBuilder = typename kj::Decay<T>::Builds;
 // FromBuilder<MyType::Builder> = MyType (for any Cap'n Proto type).
 
+template <typename T>
+using FromClient = typename kj::Decay<T>::Calls;
+// FromReader<MyType::Client> = MyType (for any Cap'n Proto interface type).
+
+template <typename T>
+using FromServer = typename kj::Decay<T>::Serves;
+// FromBuilder<MyType::Server> = MyType (for any Cap'n Proto interface type).
+
 namespace _ {  // private
 template <typename T, Kind k = kind<T>()>
 struct PointerHelpers;
 }  // namespace _ (private)
+
+struct MessageSize {
+  // Size of a message.  Every struct type has a method `.totalSize()` that returns this.
+  uint64_t wordCount;
+  uint capCount;
+};
 
 // =======================================================================================
 // Raw memory types and measures
@@ -256,13 +307,14 @@ constexpr WordCount WORDS = kj::unit<WordCount>();
 constexpr ElementCount ELEMENTS = kj::unit<ElementCount>();
 constexpr WirePointerCount POINTERS = kj::unit<WirePointerCount>();
 
-constexpr auto BITS_PER_BYTE = 8 * BITS / BYTES;
-constexpr auto BITS_PER_WORD = 64 * BITS / WORDS;
-constexpr auto BYTES_PER_WORD = 8 * BYTES / WORDS;
+// GCC 4.7 actually gives unused warnings on these constants in opt mode...
+constexpr auto BITS_PER_BYTE KJ_UNUSED = 8 * BITS / BYTES;
+constexpr auto BITS_PER_WORD KJ_UNUSED = 64 * BITS / WORDS;
+constexpr auto BYTES_PER_WORD KJ_UNUSED = 8 * BYTES / WORDS;
 
-constexpr auto BITS_PER_POINTER = 64 * BITS / POINTERS;
-constexpr auto BYTES_PER_POINTER = 8 * BYTES / POINTERS;
-constexpr auto WORDS_PER_POINTER = 1 * WORDS / POINTERS;
+constexpr auto BITS_PER_POINTER KJ_UNUSED = 64 * BITS / POINTERS;
+constexpr auto BYTES_PER_POINTER KJ_UNUSED = 8 * BYTES / POINTERS;
+constexpr auto WORDS_PER_POINTER KJ_UNUSED = 1 * WORDS / POINTERS;
 
 constexpr WordCount POINTER_SIZE_IN_WORDS = 1 * POINTERS * WORDS_PER_POINTER;
 

@@ -39,6 +39,34 @@ TEST(Memory, OwnConst) {
   EXPECT_EQ(3, *ci2);
 }
 
+TEST(Memory, CanConvert) {
+  struct Super { virtual ~Super(); };
+  struct Sub: public Super {};
+
+  static_assert(canConvert<Own<Sub>, Own<Super>>(), "failure");
+  static_assert(!canConvert<Own<Super>, Own<Sub>>(), "failure");
+}
+
+struct Nested {
+  Nested(bool& destroyed): destroyed(destroyed) {}
+  ~Nested() { destroyed = true; }
+
+  bool& destroyed;
+  Own<Nested> nested;
+};
+
+TEST(Memory, AssignNested) {
+  bool destroyed1 = false, destroyed2 = false;
+  auto nested = heap<Nested>(destroyed1);
+  nested->nested = heap<Nested>(destroyed2);
+  EXPECT_FALSE(destroyed1 || destroyed2);
+  nested = kj::mv(nested->nested);
+  EXPECT_TRUE(destroyed1);
+  EXPECT_FALSE(destroyed2);
+  nested = nullptr;
+  EXPECT_TRUE(destroyed1 && destroyed2);
+}
+
 // TODO(test):  More tests.
 
 }  // namespace

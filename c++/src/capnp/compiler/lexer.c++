@@ -31,7 +31,7 @@ namespace compiler {
 namespace p = kj::parse;
 
 bool lex(kj::ArrayPtr<const char> input, LexedStatements::Builder result,
-         const ErrorReporter& errorReporter) {
+         ErrorReporter& errorReporter) {
   Lexer lexer(Orphanage::getForMessageContaining(result), errorReporter);
 
   auto parser = p::sequence(lexer.getParsers().statementSequence, p::endOfInput);
@@ -53,7 +53,7 @@ bool lex(kj::ArrayPtr<const char> input, LexedStatements::Builder result,
 }
 
 bool lex(kj::ArrayPtr<const char> input, LexedTokens::Builder result,
-         const ErrorReporter& errorReporter) {
+         ErrorReporter& errorReporter) {
   Lexer lexer(Orphanage::getForMessageContaining(result), errorReporter);
 
   auto parser = p::sequence(lexer.getParsers().tokenSequence, p::endOfInput);
@@ -78,11 +78,11 @@ namespace {
 
 typedef p::Span<uint32_t> Location;
 
-Token::Body::Builder initTok(Orphan<Token>& t, const Location& loc) {
-  auto tb = t.get();
-  tb.setStartByte(loc.begin());
-  tb.setEndByte(loc.end());
-  return tb.getBody();
+Token::Builder initTok(Orphan<Token>& t, const Location& loc) {
+  auto builder = t.get();
+  builder.setStartByte(loc.begin());
+  builder.setEndByte(loc.end());
+  return builder;
 }
 
 void buildTokenSequenceList(List<List<Token>>::Builder builder,
@@ -138,8 +138,8 @@ constexpr auto docComment = p::optional(p::sequence(
 
 }  // namespace
 
-Lexer::Lexer(Orphanage orphanageParam, const ErrorReporter& errorReporterParam)
-    : orphanage(orphanageParam), errorReporter(errorReporterParam) {
+Lexer::Lexer(Orphanage orphanageParam, ErrorReporter& errorReporterParam)
+    : orphanage(orphanageParam) {
 
   // Note that because passing an lvalue to a parser constructor uses it by-referencee, it's safe
   // for us to use parsers.tokenSequence even though we haven't yet constructed it.
@@ -224,7 +224,7 @@ Lexer::Lexer(Orphanage orphanageParam, const ErrorReporter& errorReporterParam)
             KJ_IF_MAYBE(c, comment) {
               attachDocComment(builder, kj::mv(*c));
             }
-            builder.getBlock().setNone();
+            builder.setLine();
             return result;
           }),
       transform(
@@ -241,7 +241,7 @@ Lexer::Lexer(Orphanage orphanageParam, const ErrorReporter& errorReporterParam)
             } else KJ_IF_MAYBE(c, lateComment) {
               attachDocComment(builder, kj::mv(*c));
             }
-            auto list = builder.getBlock().initStatements(statements.size());
+            auto list = builder.initBlock(statements.size());
             for (uint i = 0; i < statements.size(); i++) {
               list.adoptWithCaveats(i, kj::mv(statements[i]));
             }
@@ -269,7 +269,7 @@ Lexer::Lexer(Orphanage orphanageParam, const ErrorReporter& errorReporterParam)
   parsers.emptySpace = commentsAndWhitespace;
 }
 
-Lexer::~Lexer() {}
+Lexer::~Lexer() noexcept(false) {}
 
 }  // namespace compiler
 }  // namespace capnp

@@ -160,8 +160,11 @@ struct TestDefaults {
   interfaceList @33 : List(Void);  # TODO
 }
 
-struct TestObject {
-  objectField @0 :Object;
+struct TestAnyPointer {
+  anyPointerField @0 :AnyPointer;
+
+  # Do not add any other fields here!  Some tests rely on anyPointerField being the last pointer
+  # in the struct.
 }
 
 struct TestOutOfOrder {
@@ -177,7 +180,7 @@ struct TestOutOfOrder {
 }
 
 struct TestUnion {
-  union0 @0 union {
+  union0 @0! :union {
     # Pack union 0 under ideal conditions: there is no unused padding space prior to it.
     u0f0s0  @4: Void;
     u0f0s1  @5: Bool;
@@ -200,7 +203,7 @@ struct TestUnion {
   # Pack one bit in order to make pathological situation for union1.
   bit0 @18: Bool;
 
-  union1 @1 union {
+  union1 @1! :union {
     # Pack pathologically bad case.  Each field takes up new space.
     u1f0s0  @19: Void;
     u1f0s1  @20: Bool;
@@ -216,7 +219,7 @@ struct TestUnion {
     u1f0sp  @30: Text;
     u1f1sp  @31: Text;
 
-    # Pack more stuff into union1 -- should go into same space as u1f0s64.
+    # Pack more stuff into union1 -- each should go into the same space as corresponding u1f0s*.
     u1f2s0  @32: Void;
     u1f2s1  @33: Bool;
     u1f2s8  @34: Int8;
@@ -237,7 +240,7 @@ struct TestUnion {
   # Interleave two unions to be really annoying.
   # Also declare in reverse order to make sure union discriminant values are sorted by field number
   # and not by declaration order.
-  union2 @2 union {
+  union2 @2! :union {
     u2f0s64 @54: Int64;
     u2f0s32 @52: Int32;
     u2f0s16 @50: Int16;
@@ -245,7 +248,7 @@ struct TestUnion {
     u2f0s1 @45: Bool;
   }
 
-  union3 @3 union {
+  union3 @3! :union {
     u3f0s64 @55: Int64;
     u3f0s32 @53: Int32;
     u3f0s16 @51: Int16;
@@ -256,13 +259,98 @@ struct TestUnion {
   byte0 @49: UInt8;
 }
 
+struct TestUnnamedUnion {
+  before @0 :Text;
+
+  union {
+    foo @1 :UInt16;
+    bar @3 :UInt32;
+  }
+
+  middle @2 :UInt16;
+
+  after @4 :Text;
+}
+
+struct TestUnionInUnion {
+  # There is no reason to ever do this.
+  outer :union {
+    inner :union {
+      foo @0 :Int32;
+      bar @1 :Int32;
+    }
+    baz @2 :Int32;
+  }
+}
+
+struct TestGroups {
+  groups :union {
+    foo :group {
+      corge @0 :Int32;
+      grault @2 :Int64;
+      garply @8 :Text;
+    }
+    bar :group {
+      corge @3 :Int32;
+      grault @4 :Text;
+      garply @5 :Int64;
+    }
+    baz :group {
+      corge @1 :Int32;
+      grault @6 :Text;
+      garply @7 :Text;
+    }
+  }
+}
+
+struct TestInterleavedGroups {
+  group1 :group {
+    foo @0 :UInt32;
+    bar @2 :UInt64;
+    union {
+      qux @4 :UInt16;
+      corge :group {
+        grault @6 :UInt64;
+        garply @8 :UInt16;
+        plugh @14 :Text;
+        xyzzy @16 :Text;
+      }
+
+      fred @12 :Text;
+    }
+
+    waldo @10 :Text;
+  }
+
+  group2 :group {
+    foo @1 :UInt32;
+    bar @3 :UInt64;
+    union {
+      qux @5 :UInt16;
+      corge :group {
+        grault @7 :UInt64;
+        garply @9 :UInt16;
+        plugh @15 :Text;
+        xyzzy @17 :Text;
+      }
+
+      fred @13 :Text;
+    }
+
+    waldo @11 :Text;
+  }
+}
+
 struct TestUnionDefaults {
   s16s8s64s8Set @0 :TestUnion =
-      (union0 = u0f0s16(321), union1 = u1f0s8(123), union2 = u2f0s64(12345678901234567),
-       union3 = u3f0s8(55));
+      (union0 = (u0f0s16 = 321), union1 = (u1f0s8 = 123), union2 = (u2f0s64 = 12345678901234567),
+       union3 = (u3f0s8 = 55));
   s0sps1s32Set @1 :TestUnion =
-      (union0 = u0f1s0(void), union1 = u1f0sp("foo"), union2 = u2f0s1(true),
-       union3 = u3f0s32(12345678));
+      (union0 = (u0f1s0 = void), union1 = (u1f0sp = "foo"), union2 = (u2f0s1 = true),
+       union3 = (u3f0s32 = 12345678));
+
+  unnamed1 @2 :TestUnnamedUnion = (foo = 123);
+  unnamed2 @3 :TestUnnamedUnion = (bar = 321, before = "foo", after = "bar");
 }
 
 struct TestNestedTypes {
@@ -307,6 +395,15 @@ struct TestLists {
   struct Struct64 { f @0 :UInt64; }
   struct StructP  { f @0 :Text; }
 
+  # Versions of the above which cannot be encoded as primitive lists.
+  struct Struct0c  { f @0 :Void; pad @1 :Text; }
+  struct Struct1c  { f @0 :Bool; pad @1 :Text; }
+  struct Struct8c  { f @0 :UInt8; pad @1 :Text; }
+  struct Struct16c { f @0 :UInt16; pad @1 :Text; }
+  struct Struct32c { f @0 :UInt32; pad @1 :Text; }
+  struct Struct64c { f @0 :UInt64; pad @1 :Text; }
+  struct StructPc  { f @0 :Text; pad @1 :UInt64; }
+
   list0  @0 :List(Struct0);
   list1  @1 :List(Struct1);
   list8  @2 :List(Struct8);
@@ -341,20 +438,20 @@ struct TestListDefaults {
 }
 
 struct TestLateUnion {
-  # Test what happens if the unions are the first ordinals in the struct.  At one point this was
-  # broken for the dynamic API.
+  # Test what happens if the unions are not the first ordinals in the struct.  At one point this
+  # was broken for the dynamic API.
 
   foo @0 :Int32;
   bar @1 :Text;
   baz @2 :Int16;
 
-  theUnion @3 union {
+  theUnion @3! :union {
     qux @4 :Text;
     corge @5 :List(Int32);
     grault @6 :Float32;
   }
 
-  anotherUnion @7 union {
+  anotherUnion @7! :union {
     qux @8 :Text;
     corge @9 :List(Int32);
     grault @10 :Float32;
@@ -378,8 +475,207 @@ struct TestNewVersion {
 }
 
 struct TestStructUnion {
-  un @0 union {
-    allTypes @1 :TestAllTypes;
-    object @2 :TestObject;
+  un @0! :union {
+    struct @1 :SomeStruct;
+    object @2 :TestAnyPointer;
+  }
+
+  struct SomeStruct {
+    someText @0 :Text;
+    moreText @1 :Text;
   }
 }
+
+struct TestPrintInlineStructs {
+  someText @0 :Text;
+
+  structList @1 :List(InlineStruct);
+  struct InlineStruct {
+    int32Field @0 :Int32;
+    textField @1 :Text;
+  }
+}
+
+struct TestEmptyStruct {}
+
+struct TestConstants {
+  const voidConst      :Void    = void;
+  const boolConst      :Bool    = true;
+  const int8Const      :Int8    = -123;
+  const int16Const     :Int16   = -12345;
+  const int32Const     :Int32   = -12345678;
+  const int64Const     :Int64   = -123456789012345;
+  const uint8Const     :UInt8   = 234;
+  const uint16Const    :UInt16  = 45678;
+  const uint32Const    :UInt32  = 3456789012;
+  const uint64Const    :UInt64  = 12345678901234567890;
+  const float32Const   :Float32 = 1234.5;
+  const float64Const   :Float64 = -123e45;
+  const textConst      :Text    = "foo";
+  const dataConst      :Data    = "bar";
+  const structConst    :TestAllTypes = (
+      voidField      = void,
+      boolField      = true,
+      int8Field      = -12,
+      int16Field     = 3456,
+      int32Field     = -78901234,
+      int64Field     = 56789012345678,
+      uInt8Field     = 90,
+      uInt16Field    = 1234,
+      uInt32Field    = 56789012,
+      uInt64Field    = 345678901234567890,
+      float32Field   = -1.25e-10,
+      float64Field   = 345,
+      textField      = "baz",
+      dataField      = "qux",
+      structField    = (
+          textField = "nested",
+          structField = (textField = "really nested")),
+      enumField      = baz,
+      # interfaceField can't have a default
+
+      voidList      = [void, void, void],
+      boolList      = [false, true, false, true, true],
+      int8List      = [12, -34, -0x80, 0x7f],
+      int16List     = [1234, -5678, -0x8000, 0x7fff],
+      int32List     = [12345678, -90123456, -0x80000000, 0x7fffffff],
+      int64List     = [123456789012345, -678901234567890, -0x8000000000000000, 0x7fffffffffffffff],
+      uInt8List     = [12, 34, 0, 0xff],
+      uInt16List    = [1234, 5678, 0, 0xffff],
+      uInt32List    = [12345678, 90123456, 0, 0xffffffff],
+      uInt64List    = [123456789012345, 678901234567890, 0, 0xffffffffffffffff],
+      float32List   = [0, 1234567, 1e37, -1e37, 1e-37, -1e-37],
+      float64List   = [0, 123456789012345, 1e306, -1e306, 1e-306, -1e-306],
+      textList      = ["quux", "corge", "grault"],
+      dataList      = ["garply", "waldo", "fred"],
+      structList    = [
+          (textField = "x structlist 1"),
+          (textField = "x structlist 2"),
+          (textField = "x structlist 3")],
+      enumList      = [qux, bar, grault]
+      # interfaceList can't have a default
+      );
+  const enumConst      :TestEnum = corge;
+
+  const voidListConst      :List(Void)    = [void, void, void, void, void, void];
+  const boolListConst      :List(Bool)    = [true, false, false, true];
+  const int8ListConst      :List(Int8)    = [111, -111];
+  const int16ListConst     :List(Int16)   = [11111, -11111];
+  const int32ListConst     :List(Int32)   = [111111111, -111111111];
+  const int64ListConst     :List(Int64)   = [1111111111111111111, -1111111111111111111];
+  const uint8ListConst     :List(UInt8)   = [111, 222] ;
+  const uint16ListConst    :List(UInt16)  = [33333, 44444];
+  const uint32ListConst    :List(UInt32)  = [3333333333];
+  const uint64ListConst    :List(UInt64)  = [11111111111111111111];
+  const float32ListConst   :List(Float32) = [5555.5, inf, -inf, nan];
+  const float64ListConst   :List(Float64) = [7777.75, inf, -inf, nan];
+  const textListConst      :List(Text)    = ["plugh", "xyzzy", "thud"];
+  const dataListConst      :List(Data)    = ["oops", "exhausted", "rfc3092"];
+  const structListConst    :List(TestAllTypes) = [
+      (textField = "structlist 1"),
+      (textField = "structlist 2"),
+      (textField = "structlist 3")];
+  const enumListConst      :List(TestEnum) = [foo, garply];
+}
+
+const globalInt :UInt32 = 12345;
+const globalText :Text = "foobar";
+const globalStruct :TestAllTypes = (int32Field = 54321);
+const globalPrintableStruct :TestPrintInlineStructs = (someText = "foo");
+const derivedConstant :TestAllTypes = (
+    uInt32Field = .globalInt,
+    textField = TestConstants.textConst,
+    structField = TestConstants.structConst,
+    int16List = TestConstants.int16ListConst,
+    structList = TestConstants.structListConst);
+
+interface TestInterface {
+  foo @0 (i :UInt32, j :Bool) -> (x :Text);
+  bar @1 () -> ();
+  baz @2 (s: TestAllTypes);
+}
+
+interface TestExtends extends(TestInterface) {
+  qux @0 ();
+  corge @1 TestAllTypes -> ();
+  grault @2 () -> TestAllTypes;
+}
+
+interface TestPipeline {
+  getCap @0 (n: UInt32, inCap :TestInterface) -> (s: Text, outBox :Box);
+  testPointers @1 (cap :TestInterface, obj :AnyPointer, list :List(TestInterface)) -> ();
+
+  struct Box {
+    cap @0 :TestInterface;
+  }
+}
+
+interface TestCallOrder {
+  getCallSequence @0 (expected: UInt32) -> (n: UInt32);
+  # First call returns 0, next returns 1, ...
+  #
+  # The input `expected` is ignored but useful for disambiguating debug logs.
+}
+
+interface TestTailCallee {
+  struct TailResult {
+    i @0 :UInt32;
+    t @1 :Text;
+    c @2 :TestCallOrder;
+  }
+
+  foo @0 (i :Int32, t :Text) -> TailResult;
+}
+
+interface TestTailCaller {
+  foo @0 (i :Int32, callee :TestTailCallee) -> TestTailCallee.TailResult;
+}
+
+interface TestMoreStuff extends(TestCallOrder) {
+  # Catch-all type that contains lots of testing methods.
+
+  callFoo @0 (cap :TestInterface) -> (s: Text);
+  # Call `cap.foo()`, check the result, and return "bar".
+
+  callFooWhenResolved @1 (cap :TestInterface) -> (s: Text);
+  # Like callFoo but waits for `cap` to resolve first.
+
+  neverReturn @2 (cap :TestInterface) -> (capCopy :TestInterface);
+  # Doesn't return.  You should cancel it.
+
+  hold @3 (cap :TestInterface) -> ();
+  # Returns immediately but holds on to the capability.
+
+  callHeld @4 () -> (s: Text);
+  # Calls the capability previously held using `hold` (and keeps holding it).
+
+  getHeld @5 () -> (cap :TestInterface);
+  # Returns the capability previously held using `hold` (and keeps holding it).
+
+  echo @6 (cap :TestCallOrder) -> (cap :TestCallOrder);
+  # Just returns the input cap.
+
+  expectCancel @7 (cap :TestInterface) -> ();
+  # evalLater()-loops forever, holding `cap`.  Must be canceled.
+}
+
+struct TestSturdyRefHostId {
+  host @0 :Text;
+}
+
+struct TestSturdyRefObjectId {
+  tag @0 :Tag;
+  enum Tag {
+    testInterface @0;
+    testExtends @1;
+    testPipeline @2;
+    testTailCallee @3;
+    testTailCaller @4;
+    testMoreStuff @5;
+  }
+}
+
+struct TestProvisionId {}
+struct TestRecipientId {}
+struct TestThirdPartyCapId {}
+struct TestJoinResult {}

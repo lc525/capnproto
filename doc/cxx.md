@@ -1,12 +1,13 @@
 ---
 layout: page
-title: C++ Runtime
+title: C++ Serialization
 ---
 
-# C++ Runtime
+# C++ Serialization
 
 The Cap'n Proto C++ runtime implementation provides an easy-to-use interface for manipulating
-messages backed by fast pointer arithmetic.
+messages backed by fast pointer arithmetic.  This page discusses the serialization layer of
+the runtime; see [C++ RPC](cxxrpc.html) for information about the RPC layer.
 
 ## Example Usage
 
@@ -30,11 +31,11 @@ struct Person {
     }
   }
 
-  employment @4 union {
-    unemployed @5 :Void;
-    employer @6 :Text;
-    school @7 :Text;
-    selfEmployed @8 :Void;
+  employment :union {
+    unemployed @4 :Void;
+    employer @5 :Text;
+    school @6 :Text;
+    selfEmployed @7 :Void;
     # We assume that a person is only one of these.
   }
 }
@@ -162,13 +163,24 @@ together -- KJ is simply the stuff which is not specific to Cap'n Proto serializ
 useful to others independently of Cap'n Proto.  For now, the the two are distributed together.  The
 name "KJ" has no particular meaning; it was chosen to be short and easy-to-type.
 
+As of v0.3, KJ is distributed with Cap'n Proto but built as a separate library.  You may need
+to explicitly link against libraries:  `-lcapnp -lkj`
+
 ## Generating Code
 
 To generate C++ code from your `.capnp` [interface definition](language.html), run:
 
-    capnpc -oc++ myproto.capnp
+    capnp compile -oc++ myproto.capnp
 
 This will create `myproto.capnp.h` and `myproto.capnp.c++` in the same directory as `myproto.capnp`.
+
+To use this code in your app, you must link against both `libcapnp` and `libkj`.  If you use
+`pkg-config`, Cap'n Proto provides the `capnp` module to simplify discovery of compiler and linker
+flags.
+
+If you use [RPC](cxxrpc.html) (i.e., your schema defines [interfaces](language.html#interfaces)),
+then you will additionally nead to link against `libcapnp-rpc` and `libkj-async`, or use the
+`capnp-rpc` `pkg-config` module.
 
 ### Setting a Namespace
 
@@ -181,10 +193,10 @@ $Cxx.namespace("foo::bar::baz");
 {% endhighlight %}
 
 Note that `capnp/c++.capnp` is installed in `$PREFIX/include` (`/usr/local/include` by default)
-when you install the C++ runtime.  `capnpc` automatically searches `/usr/include` and
+when you install the C++ runtime.  The `capnp` tool automatically searches `/usr/include` and
 `/usr/local/include` for imports that start with a `/`, so it should "just work".  If you installed
-somewhere else, you may need to add it to the search path with the `-I` flag to `capnpc`, which
-works much like the compiler flag of the same name.
+somewhere else, you may need to add it to the search path with the `-I` flag to `capnp compile`,
+which works much like the compiler flag of the same name.
 
 ## Types
 
@@ -197,7 +209,7 @@ Primitive types map to the obvious C++ types:
 * `UIntNN` -> `uintNN_t`
 * `Float32` -> `float`
 * `Float64` -> `double`
-* `Void` -> `::capnp::Void` (An enum with one value: `::capnp::Void::VOID`)
+* `Void` -> `::capnp::Void` (An empty struct; its only value is `::capnp::VOID`)
 
 ### Structs
 
@@ -231,13 +243,13 @@ MyStruct::Reader getMyStructField();
 ::capnp::List<double> getMyListField();
 {% endhighlight %}
 
-`Foo::Builder`, meanwhile, has two or three methods for each field `bar`:
+`Foo::Builder`, meanwhile, has several methods for each field `bar`:
 
 * `getBar()`:  For primitives, returns the value.  For composites, returns a Builder for the
   composite.  If a composite field has not been initialized (i.e. this is the first time it has
   been accessed), it will be initialized to a copy of the field's default value before returning.
-* `setBar(x)`:  For primitives, sets the value to X.  For composites, sets the value to a copy of
-  x, which must be a Reader for the type.
+* `setBar(x)`:  For primitives, sets the value to x.  For composites, sets the value to a deep copy
+  of x, which must be a Reader for the type.
 * `initBar(n)`:  Only for lists and blobs.  Sets the field to a newly-allocated list or blob
   of size n and returns a Builder for it.  The elements of the list are initialized to their empty
   state (zero for numbers, default values for structs).
@@ -245,6 +257,12 @@ MyStruct::Reader getMyStructField();
   Builder for it.  Note that the newly-allocated struct is initialized to the default value for
   the struct's _type_ (i.e., all-zero) rather than the default value for the field `bar` (if it
   has one).
+* `hasBar()`:  Only for pointer fields (e.g. structs, lists, blobs).  Returns true if the pointer
+  has been initialized (non-null).  (This method is also available on readers.)
+* `adoptBar(x)`:  Only for pointer fields.  Adopts the orphaned object x, linking it into the field
+  `bar` without copying.  See the section on orphans.
+* `disownBar()`:  Disowns the value pointed to by `bar`, setting the pointer to null and returning
+  its previous value as an orphan.  See the section on orphans.
 
 {% highlight c++ %}
 // Example Builder methods:
@@ -272,14 +290,26 @@ void setMyListField(::capnp::List<double>::Reader value);
 ::capnp::List<double>::Builder initMyListField(size_t size);
 {% endhighlight %}
 
+### Groups
+
+Groups look a lot like a combination of a nested type and a field of that type, except that you
+cannot set, adopt, or disown a group -- you can only get and init it.
+
 ### Unions
 
-For each union `foo` declared in the struct, the struct's reader and builder have a method
-`getFoo()` which returns a reader/builder for the union.  The union reader/builder has accessors
-for each field exactly like a struct's accessors.  It also has an accessor `which()` which returns
-an enum indicating which member of the union is currently set.  Setting any member of the union
-updates the value returned by `which()`.  Getting a member other than the currently-set member
-crashes in debug mode or returns garbage when `NDEBUG` is defined.
+A named union (as opposed to an unnamed one) works just like a group, except with some additions:
+
+* For each field `foo`, the union reader and builder have a method `isFoo()` which returns true
+  if `foo` is the currently-set field in the union.
+* The union reader and builder also have a method `which()` that returns an enum value indicating
+  which field is currently set.
+* Calling the set, init, or adopt accessors for a field makes it the currently-set field.
+* Calling the get or disown accessors on a field that isn't currently set will throw an
+  exception in debug mode or return garbage when `NDEBUG` is defined.
+
+Unnamed unions differ from named unions only in that the accessor methods from the union's members
+are added directly to the containing type's reader and builder, rather than generating a nested
+type.
 
 See the [example](#example_usage) at the top of the page for an example of unions.
 
@@ -315,7 +345,7 @@ the enum's values are scoped within the type.  E.g. for an enum `Foo` with value
 refer to the value as `Foo::BAR`.
 
 To match prevaling C++ style, an enum's value names are converted to UPPERCASE_WITH_UNDERSCORES
-(whereas in the definition language you'd write them in camelCase).
+(whereas in the schema language you'd write them in camelCase).
 
 Keep in mind when writing `switch` blocks that an enum read off the wire may have a numeric
 value that is not listed in its definition.  This may be the case if the sender is using a newer
@@ -331,13 +361,23 @@ implement `size()` and `operator[]` methods.  `Builder::operator[]` even returns
 (unlike with `List<T>`).  `Text::Reader` additionally has a method `cStr()` which returns a
 NUL-terminated `const char*`.
 
+As a special convenience, if you are using GCC 4.8+ or Clang, `Text::Reader` (and its underlying
+type, `kj::StringPtr`) can be implicitly converted to and from `std::string` format.  This is
+accomplished without actually `#include`ing `<string>`, since some clients do not want to rely
+on this rather-bulky header.  In fact, any class which defines a `.c_str()` method will be
+implicitly convertible in this way.  Unfortunately, this trick doesn't work on GCC 4.7.
+
 ### Interfaces
 
-Interfaces (RPC) are not yet implemented at this time.
+[Interfaces (RPC) have their own page.](cxxrpc.html)
 
 ### Constants
 
-Constants are not yet implemented at this time.  (They are not hard, but they are low-priority.)
+Constants are exposed with their names converted to UPPERCASE_WITH_UNDERSCORES naming style
+(whereas in the schema language you’d write them in camelCase).  Primitive constants are just
+`constexpr` values.  Pointer-type constants (e.g. structs, lists, and blobs) are represented
+using a proxy object that can be converted to the relevant `Reader` type, either implicitly or
+using the unary `*` or `->` operators.
 
 ## Messages and I/O
 
@@ -359,6 +399,29 @@ will need to set up a multi-use buffered stream.  Buffered I/O may also be a goo
 details.
 
 There is an [example](#example_usage) of all this at the beginning of this page.
+
+### Using mmap
+
+Cap'n Proto can be used together with `mmap()` (or Win32's `MapViewOfFile()`) for extremely fast
+reads, especially when you only need to use a subset of the data in the file.  Currently,
+Cap'n Proto is not well-suited for _writing_ via `mmap()`, only reading, but this is only because
+we have not yet invented a mutable segment framing format -- the underlying design should
+eventually work for both.
+
+To take advantage of `mmap()` at read time, write your file in regular serialized (but NOT packed)
+format -- that is, use `writeMessageToFd()`, _not_ `writePackedMessageToFd()`.  Now, `mmap()` in
+the entire file, and then pass the mapped memory to the constructor of
+`capnp::FlatArrayMessageReader` (defined in `capnp/serialize.h`).  That's it.  You can use the
+reader just like a normal `StreamFdMessageReader`.  The operating system will automatically page
+in data from disk as you read it.
+
+`mmap()` works best when reading from flash media, or when the file is already hot in cache.
+It works less well with slow rotating disks.  Here, disk seeks make random access relatively
+expensive.  Also, if I/O throughput is your bottleneck, then the fact that mmaped data cannot
+be packed or compressed may hurt you.  However, it all depends on what fraction of the file you're
+actually reading -- if you only pull one field out of one deeply-nested struct in a huge tree, it
+may still be a win.  The only way to know for sure is to do benchmarks!  (But be careful to make
+sure your benchmark is actually interacting with disk and not cache.)
 
 ## Dynamic Reflection
 
@@ -385,7 +448,6 @@ using ::capnp::DynamicValue;
 using ::capnp::DynamicStruct;
 using ::capnp::DynamicEnum;
 using ::capnp::DynamicList;
-using ::capnp::DynamicUnion;
 using ::capnp::List;
 using ::capnp::Schema;
 using ::capnp::StructSchema;
@@ -420,7 +482,7 @@ void dynamicWriteAddressBook(int fd, StructSchema schema) {
   auto phone0 = alicePhones[0].as<DynamicStruct>();
   phone0.set("number", "555-1212");
   phone0.set("type", "mobile");
-  alice.get("employment").as<DynamicUnion>()
+  alice.get("employment").as<DynamicStruct>()
        .set("school", "MIT");
 
   auto bob = people[1].as<DynamicStruct>();
@@ -436,8 +498,8 @@ void dynamicWriteAddressBook(int fd, StructSchema schema) {
   bobPhones[0].setType(Person::PhoneNumber::Type::HOME);
   bobPhones[1].setNumber("555-7654");
   bobPhones[1].setType(Person::PhoneNumber::Type::WORK);
-  bob.get("employment").as<DynamicUnion>()
-     .set("unemployed", Void::VOID);
+  bob.get("employment").as<DynamicStruct>()
+     .set("unemployed", ::capnp::VOID);
 
   writePackedMessageToFd(fd, message);
 }
@@ -495,31 +557,18 @@ void dynamicPrintValue(DynamicValue::Reader value) {
       std::cout << "(";
       auto structValue = value.as<DynamicStruct>();
       bool first = true;
-      for (auto member:
-           structValue.getSchema().getMembers()) {
+      for (auto field: structValue.getSchema().getFields()) {
+        if (!structValue.has(field)) continue;
         if (first) {
           first = false;
         } else {
           std::cout << ", ";
         }
-        std::cout << member.getProto().getName().cStr()
+        std::cout << field.getProto().getName().cStr()
                   << " = ";
-        dynamicPrintValue(structValue.get(member));
+        dynamicPrintValue(structValue.get(field));
       }
       std::cout << ")";
-      break;
-    }
-    case DynamicValue::UNION: {
-      auto unionValue = value.as<DynamicUnion>();
-      KJ_IF_MAYBE(tag, unionValue.which()) {
-        std::cout << tag->getProto().getName().cStr() << "(";
-        dynamicPrintValue(unionValue.get());
-        std::cout << ")";
-      } else {
-        // Unknown union member; must have come from newer
-        // version of the protocol.
-        std::cout << "?";
-      }
       break;
     }
     default:
@@ -547,6 +596,11 @@ Notes about the dynamic API:
   use the Dynamic API to manipulate objects of these types.  `MessageBuilder` and `MessageReader`
   have methods for accessing the message root using a dynamic schema.
 
+* While `SchemaLoader` loads binary schemas, you can also parse directly from text using
+  `SchemaParser` (`capnp/schema-parser.h`).  However, this requires linking against `libcapnpc`
+  (in addition to `libcapnp` and `libkj`) -- this code is bulky and not terribly efficient.  If
+  you can arrange to use only binary schemas at runtime, you'll be better off.
+
 * Unlike with Protobufs, there is no "global registry" of compiled-in types.  To get the schema
   for a compiled-in type, use `capnp::Schema::from<MyType>()`.
 
@@ -555,6 +609,53 @@ Notes about the dynamic API:
   and the runtime library support code is relatively small.  Moreover, if you do not use the
   dynamic API or the schema API, you do not even need to link their implementations into your
   executable.
+
+* The dynamic API performs type checks at runtime.  In case of error, it will throw an exception.
+  If you compile with `-fno-exceptions`, it will crash instead.  Correct usage of the API should
+  never throw, but bugs happen.  Enabling and catching exceptions will make your code more robust.
+
+* Loading user-provided schemas has security implications: it greatly increases the attack
+  surface of the Cap'n Proto library.  In particular, it is easy for an attacker to trigger
+  exceptions.  To protect yourself, you are strongly advised to enable exceptions and catch them.
+
+## Orphans
+
+An "orphan" is a Cap'n Proto object that is disconnected from the message structure.  That is,
+it is not the root of a message, and there is no other Cap'n Proto object holding a pointer to it.
+Thus, it has no parents.  Orphans are an advanced feature that can help avoid copies and make it
+easier to use Cap'n Proto objects as part of your application's internal state.  Typical
+applications probably won't use orphans.
+
+The class `capnp::Orphan<T>` (defined in `<capnp/orphan.h>`) represents a pointer to an orphaned
+object of type `T`.  `T` can be any struct type, `List<T>`, `Text`, or `Data`.  E.g.
+`capnp::Orphan<Person>` would be an orphaned `Person` structure.  `Orphan<T>` is a move-only class,
+similar to `std::unique_ptr<T>`.  This prevents two different objects from adopting the same
+orphan, which would result in an invalid message.
+
+An orphan can be "adopted" by another object to link it into the message structure.  Conversely,
+an object can "disown" one of its pointers, causing the pointed-to object to become an orphan.
+Every pointer-typed field `foo` provides builder methods `adoptFoo()` and `disownFoo()` for these
+purposes.  Again, these methods use C++11 move semantics.  To use them, you will need to be
+familiar with `std::move()` (or the equivalent but shorter-named `kj::mv()`).
+
+Even though an orphan is unlinked from the message tree, it still resides inside memory allocated
+for a particular message (i.e. a particular `MessageBuilder`).  An orphan can only be adopted by
+objects that live in the same message.  To move objects between messages, you must perform a copy.
+If the message is serialized while an `Orphan<T>` living within it still exists, the orphan's
+content will be part of the serialized message, but the only way the receiver could find it is by
+investigating the raw message; the Cap'n Proto API provides no way to detect or read it.
+
+To construct an orphan from scratch (without having some other object disown it), you need an
+`Orphanage`, which is essentially an orphan factory associated with some message.  You can get one
+by calling the `MessageBuilder`'s `getOrphanage()` method, or by calling the static method
+`Orphanage::getForMessageContaining(builder)` and passing it any struct or list builder.
+
+Note that when an `Orphan<T>` goes out-of-scope without being adopted, the underlying memory that
+it occupied is overwritten with zeros.  If you use packed serialization, these zeros will take very
+little bandwidth on the wire, but will still waste memory on the sending and receiving ends.
+Generally, you should avoid allocating message objects that won't be used, or if you cannot avoid
+it, arrange to copy the entire message over to a new `MessageBuilder` before serializing, since
+only the reachable objects will be copied.
 
 ## Reference
 
@@ -569,6 +670,170 @@ best reference is the header files.  See:
     capnp/schema.h
     capnp/schema-loader.h
     capnp/dynamic.h
+
+## Tips and Best Practices
+
+Here are some tips for using the C++ Cap'n Proto runtime most effectively:
+
+* Accessor methods for primitive (non-pointer) fields are fast and inline.  They should be just
+  as fast as accessing a struct field through a pointer.
+
+* Accessor methods for pointer fields, on the other hand, are not inline, as they need to validate
+  the pointer.  If you intend to access the same pointer multiple times, it is a good idea to
+  save the value to a local variable to avoid repeating this work.  This is generally not a
+  problem given C++11's `auto`.
+
+  Example:
+
+      // BAD
+      frob(foo.getBar().getBaz(),
+           foo.getBar().getQux(),
+           foo.getBar().getCorge());
+
+      // GOOD
+      auto bar = foo.getBar();
+      frob(bar.getBaz(), bar.getQux(), bar.getCorge());
+
+  It is especially important to use this style when reading messages, for another reason:  as
+  described under the "security tips" section, below, every time you `get` a pointer, Cap'n Proto
+  increments a counter by the size of the target object.  If that counter hits a pre-defined limit,
+  an exception is thrown (or a default value is returned, if exceptions are disabled), to prevent
+  a malicious client from sending your server into an infinite loop with a specially-crafted
+  message.  If you repeatedly `get` the same object, you are repeatedly counting the same bytes,
+  and so you may hit the limit prematurely.  (Since Cap'n Proto readers are backed directly by
+  the underlying message buffer and do not have anywhere else to store per-object information, it
+  is impossible to remember whether you've seen a particular object already.)
+
+* Internally, all pointer fields start out "null", even if they have default values.  When you have
+  a pointer field `foo` and you call `getFoo()` on the containing struct's `Reader`, if the field
+  is "null", you will receive a reader for that field's default value.  This reader is backed by
+  read-only memory; nothing is allocated.  However, when you call `get` on a _builder_, and the
+  field is null, then the implementation must make a _copy_ of the default value to return to you.
+  Thus, you've caused the field to become non-null, just by "reading" it.  On the other hand, if
+  you call `init` on that field, you are explicitly replacing whatever value is already there
+  (null or not) with a newly-allocated instance, and that newly-allocated instance is _not_ a
+  copy of the field's default value, but just a completely-uninitialized instance of the
+  appropriate type.
+
+* It is possible to receive a struct value constructed from a newer version of the protocol than
+  the one your binary was built with, and that struct might have extra fields that you don't know
+  about.  The Cap'n Proto implementation tries to avoid discarding this extra data.  If you copy
+  the struct from one message to another (e.g. by calling a set() method on a parent object), the
+  extra fields will be preserved.  This makes it possible to build proxies that receive messages
+  and forward them on without having to rebuild the proxy every time a new field is added.  You
+  must be careful, however:  in some cases, it's not possible to retain the extra fields, because
+  they need to be copied into a space that is allocated before the expected content is known.
+  In particular, lists of structs are represented as a flat array, not as an array of pointers.
+  Therefore, all memory for all structs in the list must be allocated upfront.  Hence, copying
+  a struct value from another message into an element of a list will truncate the value.  Because
+  of this, the setter method for struct lists is called `setWithCaveats()` rather than just `set()`.
+
+* Messages are built in "arena" or "region" style:  each object is allocated sequentially in
+  memory, until there is no more room in the segment, in which case a new segment is allocated,
+  and objects continue to be allocated sequentially in that segment.  This design is what makes
+  Cap'n Proto possible at all, and it is very fast compared to other allocation strategies.
+  However, it has the disadvantage that if you allocate an object and then discard it, that memory
+  is lost.  In fact, the empty space will still become part of the serialized message, even though
+  it is unreachable.  The implementation will try to zero it out, so at least it should pack well,
+  but it's still better to avoid this situation.  Some ways that this can happen include:
+  * If you `init` a field that is already initialized, the previous value is discarded.
+  * If you create an orphan that is never adopted into the message tree.
+  * If you use `adoptWithCaveats` to adopt an orphaned struct into a struct list, then a shallow
+    copy is necessary, since the struct list requires that its elements are sequential in memory.
+    The previous copy of the struct is discarded (although child objects are transferred properly).
+  * If you copy a struct value from another message using a `set` method, the copy will have the
+    same size as the original.  However, the original could have been built with an older version
+    of the protocol which lacked some fields compared to the version your program was built with.
+    If you subsequently `get` that struct, the implementation will be forced to allocate a new
+    (shallow) copy which is large enough to hold all known fields, and the old copy will be
+    discarded.  Child objects will be transferred over without being copied -- though they might
+    suffer from the same problem if you `get` them later on.
+  Sometimes, avoiding these problems is too inconvenient.  Fortunately, it's also possible to
+  clean up the mess after-the-fact:  if you copy the whole message tree into a fresh
+  `MessageBuilder`, only the reachable objects will be copied, leaving out all of the unreachable
+  dead space.
+
+  In the future, Cap'n Proto may be improved such that it can re-use dead space in a message.
+  However, this will only improve things, not fix them entirely: fragementation could still leave
+  dead space.
+
+### Build Tips
+
+* If you are worried about the binary footprint of the Cap'n Proto library, consider statically
+  linking with the `--gc-sections` linker flag.  This will allow the linker to drop pieces of the
+  library that you do not actually use.  For example, many users do not use the dynamic schema and
+  reflection APIs, which contribute a large fraction of the Cap'n Proto library's overall
+  footprint.  Keep in mind that if you ever stringify a Cap'n Proto type, the stringification code
+  depends on the dynamic API; consider only using stringification in debug builds.
+
+  If you are dynamically linking against the system's shared copy of `libcapnp`, don't worry about
+  its binary size.  Remember that only the code which you actually use will be paged into RAM, and
+  those pages are shared with other applications on the system.
+
+  Also remember to strip your binary.  In particular, `libcapnpc` (the schema parser) has
+  excessively large symbol names caused by its use of template-based parser combinators.  Stripping
+  the binary greatly reduces its size.
+
+* The Cap'n Proto library has lots of debug-only asserts that are removed `#define NDEBUG`,
+  including in headers.  If you care at all about performance, you should compile your production
+  binaries with the `-DNDEBUG` compiler flag.  In fact, if Cap'n Proto detects that you have
+  optimization enabled but have not defined `NDEBUG`, it will define it for you (with a warning),
+  unless you define `DEBUG` or `KJ_DEBUG` to explicitly request debugging.
+
+### Security Tips
+
+Cap'n Proto has not yet undergone security review.  It most likely has some vulnerabilities.  You
+should not attempt to decode Cap'n Proto messages from sources you don't trust at this time.
+
+However, assuming the Cap'n Proto implementation hardens up eventually, then the following security
+tips will apply.
+
+* It is highly recommended that you enable exceptions.  When compiled with `-fno-exceptions`,
+  Cap'n Proto categorizes exceptions into "fatal" and "recoverable" varieties.  Fatal exceptions
+  cause the server to crash, while recoverable exceptions are handled by logging an error and
+  returning a "safe" garbage value.  Fatal is preferred in cases where it's unclear what kind of
+  garbage value would constitute "safe".  The more of the library you use, the higher the chance
+  that you will leave yourself open to the possibility that an attacker could trigger a fatal
+  exception somewhere.  If you enable exceptions, then you can catch the exception instead of
+  crashing, and return an error just to the attacker rather than to everyone using your server.
+
+  Basic parsing of Cap'n Proto messages shouldn't ever trigger fatal exceptions (assuming the
+  implementation is not buggy).  However, the dynamic API -- especially if you are loading schemas
+  controlled by the attacker -- is much more exception-happy.  If you cannot use exceptions, then
+  you are advised to avoid the dynamic API when dealing with untrusted data.
+
+* If you need to process schemas from untrusted sources, take them in binary format, not text.
+  The text parser is a much larger attack surface and not designed to be secure.  For instance,
+  as of this writing, it is trivial to deadlock the parser by simply writing a constant whose value
+  depends on itself.
+
+* Cap'n Proto automatically applies two artificial limits on messages for security reasons:
+  a limit on nesting dept, and a limit on total bytes traversed.
+
+  * The nesting depth limit is designed to prevent stack overflow when handling a deeply-nested
+    recursive type, and defaults to 64.  If your types aren't recursive, it is highly unlikely
+    that you would ever hit this limit, and even if they are recursive, it's still unlikely.
+
+  * The traversal limit is designed to defend against maliciously-crafted messages which use
+    pointer cycles or overlapping objects to make a message appear much larger than it looks off
+    the wire.  While cycles and overlapping objects are illegal, they are hard to detect reliably.
+    Instead, Cap'n Proto places a limit on how many bytes worth of objects you can _dereference_
+    before it throws an exception.  This limit is assessed every time you follow a pointer.  By
+    default, the limit is 64MiB (this may change in the future).  `StreamFdMessageReader` will
+    actually reject upfront any message which is larger than the traversal limit, even before you
+    start reading it.
+
+    If you need to write your code in such a way that you might frequently re-read the same
+    pointers, instead of increasing the traversal limit to the point where it is no longer useful,
+    consider simply copying the message into a new `MallocMessageBuilder` before starting.  Then,
+    the traversal limit will be enforced only during the copy.  There is no traversal limit on
+    objects once they live in a `MessageBuilder`, even if you use `.asReader()` to convert a
+    particular object's builder to the corresponding reader type.
+
+  Both limits may be increased using `capnp::ReaderOptions`, defined in `capnp/message.h`.
+
+* Remember that enums on the wire may have a numeric value that does not match any value defined
+  in the schema.  Your `switch()` statements must always have a safe default case.
 
 ## Lessons Learned from Protocol Buffers
 
@@ -593,8 +858,7 @@ learned the hard way:
   The proliferation of template instantiations gives the Protobuf runtime library a large footprint,
   and using STL in the interface can lead to weird ABI problems and slow compiles.  Cap'n Proto
   does not use any STL containers in its interface and makes sparing use in its implementation.
-  As a result, the Cap'n Proto runtime library is very small, and code that uses it compiles
-  quickly.
+  As a result, the Cap'n Proto runtime library is smaller, and code that uses it compiles quickly.
 
 * The in-memory representation of messages in Protobuf-C++ involves many heap objects.  Each
   message (struct) is an object, each non-primitive repeated field allocates an array of pointers

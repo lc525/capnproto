@@ -23,7 +23,6 @@
 
 #include "arena.h"
 #include "debug.h"
-#include "thread.h"
 #include <gtest/gtest.h>
 #include <stdint.h>
 
@@ -115,8 +114,8 @@ TEST(Arena, Array) {
     Arena arena;
     ArrayPtr<TestObject> arr1 = arena.allocateArray<TestObject>(4);
     ArrayPtr<TestObject> arr2 = arena.allocateArray<TestObject>(2);
-    EXPECT_EQ(4, arr1.size());
-    EXPECT_EQ(2, arr2.size());
+    EXPECT_EQ(4u, arr1.size());
+    EXPECT_EQ(2u, arr2.size());
     EXPECT_LE(arr1.end(), arr2.begin());
     EXPECT_EQ(6, TestObject::count);
   }
@@ -142,8 +141,8 @@ TEST(Arena, OwnArray) {
   {
     Array<TestObject> arr1 = arena.allocateOwnArray<TestObject>(4);
     Array<TestObject> arr2 = arena.allocateOwnArray<TestObject>(2);
-    EXPECT_EQ(4, arr1.size());
-    EXPECT_EQ(2, arr2.size());
+    EXPECT_EQ(4u, arr1.size());
+    EXPECT_EQ(2u, arr2.size());
     EXPECT_LE(arr1.end(), arr2.begin());
     EXPECT_EQ(6, TestObject::count);
   }
@@ -191,9 +190,9 @@ TEST(Arena, Alignment) {
   char& c2 = arena.allocate<char>();
   ArrayPtr<char> arr = arena.allocateArray<char>(8);
 
-  EXPECT_EQ(alignof(long) + sizeof(long), &c2 - &c);
-  EXPECT_EQ(alignof(long), reinterpret_cast<char*>(&l) - &c);
-  EXPECT_EQ(sizeof(char), arr.begin() - &c2);
+  EXPECT_EQ(alignof(long) + sizeof(long), implicitCast<size_t>(&c2 - &c));
+  EXPECT_EQ(alignof(long), implicitCast<size_t>(reinterpret_cast<char*>(&l) - &c));
+  EXPECT_EQ(sizeof(char), implicitCast<size_t>(arr.begin() - &c2));
 }
 
 TEST(Arena, EndOfChunk) {
@@ -285,7 +284,7 @@ TEST(Arena, MultiSegment) {
 TEST(Arena, Constructor) {
   Arena arena;
 
-  EXPECT_EQ(123, arena.allocate<uint64_t>(123));
+  EXPECT_EQ(123u, arena.allocate<uint64_t>(123));
   EXPECT_EQ("foo", arena.allocate<StringPtr>("foo", 3));
 }
 
@@ -305,71 +304,6 @@ TEST(Arena, Strings) {
   EXPECT_EQ(foo.end() + 1, bar.begin());
   EXPECT_EQ(bar.end() + 1, quux.begin());
   EXPECT_EQ(quux.end() + 1, corge.begin());
-}
-
-struct ThreadTestObject {
-  ThreadTestObject* next;
-  void* owner;  // points into the owning thread's stack
-
-  ThreadTestObject(ThreadTestObject* next, void* owner)
-      : next(next), owner(owner) {}
-  ~ThreadTestObject() { ++destructorCount; }
-
-  static uint destructorCount;
-};
-uint ThreadTestObject::destructorCount = 0;
-
-TEST(Arena, Threads) {
-  // Test thread-safety.  We allocate objects in four threads simultaneously, verify that they
-  // are not corrupted, then verify that their destructors are all called when the Arena is
-  // destroyed.
-
-  {
-    MutexGuarded<Arena> arena;
-
-    // Func to run in each thread.
-    auto threadFunc = [&]() {
-      int me;
-      ThreadTestObject* head = nullptr;
-
-      {
-        auto lock = arena.lockShared();
-
-        // Allocate a huge linked list.
-        for (uint i = 0; i < 100000; i++) {
-          head = &lock->allocate<ThreadTestObject>(head, &me);
-        }
-      }
-
-      // Wait until all other threads are done before verifying.
-      arena.lockExclusive();
-
-      // Verify that the list hasn't been corrupted.
-      while (head != nullptr) {
-        ASSERT_EQ(&me, head->owner);
-        head = head->next;
-      }
-    };
-
-    {
-      auto lock = arena.lockExclusive();
-      Thread thread1(threadFunc);
-      Thread thread2(threadFunc);
-      Thread thread3(threadFunc);
-      Thread thread4(threadFunc);
-
-      // Wait for threads to be ready.
-      usleep(10000);
-
-      auto release = kj::mv(lock);
-      // As we go out of scope, the lock will be released (since `release` is destroyed first),
-      // allowing all the threads to start running.  We'll then join each thread.
-    }
-
-    EXPECT_EQ(0, ThreadTestObject::destructorCount);
-  }
-
-  EXPECT_EQ(400000, ThreadTestObject::destructorCount);
 }
 
 }  // namespace

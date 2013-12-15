@@ -79,6 +79,11 @@
 //
 //   `KJ_SYSCALL` can be followed by a recovery block, just like `KJ_ASSERT`.
 //
+// * `KJ_NONBLOCKING_SYSCALL(code, ...)`:  Like KJ_SYSCALL, but will not throw an exception on
+//   EAGAIN/EWOULDBLOCK.  The calling code should check the syscall's return value to see if it
+//   indicates an error; in this case, it can assume the error was EAGAIN because any other error
+//   would have caused an exception to be thrown.
+//
 // * `KJ_CONTEXT(...)`:  Notes additional contextual information relevant to any exceptions thrown
 //   from within the current scope.  That is, until control exits the block in which KJ_CONTEXT()
 //   is used, if any exception is generated, it will contain the given information in its context
@@ -96,7 +101,10 @@
 //   `FAIL_RECOVERABLE_SYSCALL` take a string and an OS error number as the first two parameters.
 //   The string should be the name of the failed system call.
 // * For every macro `FOO` above, there is a `DFOO` version (or `RECOVERABLE_DFOO`) which is only
-//   executed in debug mode.  When `NDEBUG` is defined, these macros expand to nothing.
+//   executed in debug mode, i.e. when KJ_DEBUG is defined.  KJ_DEBUG is defined automatically
+//   by common.h when compiling without optimization (unless NDEBUG is defined), but you can also
+//   define it explicitly (e.g. -DKJ_DEBUG).  Generally, production builds should NOT use KJ_DEBUG
+//   as it may enable expensive checks that are unlikely to fail.
 
 #ifndef KJ_DEBUG_H_
 #define KJ_DEBUG_H_
@@ -111,7 +119,7 @@ namespace kj {
     ::kj::_::Debug::log(__FILE__, __LINE__, ::kj::_::Debug::Severity::severity, \
                         #__VA_ARGS__, __VA_ARGS__)
 
-#define KJ_DBG(...) KJ_LOG(DEBUG, ##__VA_ARGS__)
+#define KJ_DBG(...) KJ_LOG(DBG, ##__VA_ARGS__)
 
 #define _kJ_FAULT(nature, cond, ...) \
   if (KJ_LIKELY(cond)) {} else \
@@ -129,7 +137,13 @@ namespace kj {
 #define KJ_FAIL_REQUIRE(...) _kJ_FAIL_FAULT(PRECONDITION, ##__VA_ARGS__)
 
 #define KJ_SYSCALL(call, ...) \
-  if (auto _kjSyscallResult = ::kj::_::Debug::syscall([&](){return (call);})) {} else \
+  if (auto _kjSyscallResult = ::kj::_::Debug::syscall([&](){return (call);}, false)) {} else \
+    for (::kj::_::Debug::Fault f( \
+             __FILE__, __LINE__, ::kj::Exception::Nature::OS_ERROR, \
+             _kjSyscallResult.getErrorNumber(), #call, #__VA_ARGS__, ##__VA_ARGS__);; f.fatal())
+
+#define KJ_NONBLOCKING_SYSCALL(call, ...) \
+  if (auto _kjSyscallResult = ::kj::_::Debug::syscall([&](){return (call);}, true)) {} else \
     for (::kj::_::Debug::Fault f( \
              __FILE__, __LINE__, ::kj::Exception::Nature::OS_ERROR, \
              _kjSyscallResult.getErrorNumber(), #call, #__VA_ARGS__, ##__VA_ARGS__);; f.fatal())
@@ -147,14 +161,26 @@ namespace kj {
   ::kj::_::Debug::ContextImpl<decltype(KJ_UNIQUE_NAME(_kjContextFunc))> \
       KJ_UNIQUE_NAME(_kjContext)(KJ_UNIQUE_NAME(_kjContextFunc))
 
-#ifdef NDEBUG
-#define KJ_DLOG(...) do {} while (false)
-#define KJ_DASSERT(...) do {} while (false)
-#define KJ_DREQUIRE(...) do {} while (false)
-#else
+#define _kJ_NONNULL(nature, value, ...) \
+  (*({ \
+    auto _kj_result = ::kj::_::readMaybe(value); \
+    if (KJ_UNLIKELY(!_kj_result)) { \
+      ::kj::_::Debug::Fault(__FILE__, __LINE__, ::kj::Exception::Nature::nature, 0, \
+                            #value " != nullptr", #__VA_ARGS__, ##__VA_ARGS__).fatal(); \
+    } \
+    _kj_result; \
+  }))
+#define KJ_ASSERT_NONNULL(value, ...) _kJ_NONNULL(LOCAL_BUG, value, ##__VA_ARGS__)
+#define KJ_REQUIRE_NONNULL(value, ...) _kJ_NONNULL(PRECONDITION, value, ##__VA_ARGS__)
+
+#ifdef KJ_DEBUG
 #define KJ_DLOG LOG
 #define KJ_DASSERT KJ_ASSERT
 #define KJ_DREQUIRE KJ_REQUIRE
+#else
+#define KJ_DLOG(...) do {} while (false)
+#define KJ_DASSERT(...) do {} while (false)
+#define KJ_DREQUIRE(...) do {} while (false)
 #endif
 
 namespace _ {  // private
@@ -170,7 +196,7 @@ public:
     WARNING,   // A problem was detected but execution can continue with correct output.
     ERROR,     // Something is wrong, but execution can continue with garbage output.
     FATAL,     // Something went wrong, and execution cannot continue.
-    DEBUG      // Temporary debug logging.  See KJ_DBG.
+    DBG        // Temporary debug logging.  See KJ_DBG.
 
     // Make sure to update the stringifier if you add a new severity level.
   };
@@ -215,7 +241,7 @@ public:
   };
 
   template <typename Call>
-  static SyscallResult syscall(Call&& call);
+  static SyscallResult syscall(Call&& call, bool nonblocking);
 
   class Context: public ExceptionCallback {
   public:
@@ -268,7 +294,7 @@ private:
                           ArrayPtr<String> argValues);
   static String makeContextDescriptionInternal(const char* macroArgs, ArrayPtr<String> argValues);
 
-  static int getOsErrorNumber();
+  static int getOsErrorNumber(bool nonblocking);
   // Get the error code of the last error (e.g. from errno).  Returns -1 on EINTR.
 };
 
@@ -291,10 +317,12 @@ Debug::Fault::Fault(const char* file, int line, Exception::Nature nature, int er
 }
 
 template <typename Call>
-Debug::SyscallResult Debug::syscall(Call&& call) {
+Debug::SyscallResult Debug::syscall(Call&& call, bool nonblocking) {
   while (call() < 0) {
-    int errorNum = getOsErrorNumber();
-    // getOsErrorNumber() returns -1 to indicate EINTR
+    int errorNum = getOsErrorNumber(nonblocking);
+    // getOsErrorNumber() returns -1 to indicate EINTR.
+    // Also, if nonblocking is true, then it returns 0 on EAGAIN, which will then be treated as a
+    // non-error.
     if (errorNum != -1) {
       return SyscallResult(errorNum);
     }

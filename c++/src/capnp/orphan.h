@@ -52,11 +52,17 @@ public:
   Orphan(Orphan&&) = default;
   Orphan& operator=(Orphan&&) = default;
 
-  inline typename T::Builder get();
-  inline typename T::Reader getReader() const;
+  inline BuilderFor<T> get();
+  // Get the underlying builder.  If the orphan is null, this will allocate and return a default
+  // object rather than crash.  This is done for security -- otherwise, you might enable a DoS
+  // attack any time you disown a field and fail to check if it is null.  In the case of structs,
+  // this means that the orphan is no longer null after get() returns.  In the case of lists,
+  // no actual object is allocated since a simple empty ListBuilder can be returned.
 
-  inline bool operator==(decltype(nullptr)) { return builder == nullptr; }
-  inline bool operator!=(decltype(nullptr)) { return builder == nullptr; }
+  inline ReaderFor<T> getReader() const;
+
+  inline bool operator==(decltype(nullptr)) const { return builder == nullptr; }
+  inline bool operator!=(decltype(nullptr)) const { return builder != nullptr; }
 
 private:
   _::OrphanBuilder builder;
@@ -67,7 +73,10 @@ private:
   friend struct _::PointerHelpers;
   template <typename, Kind>
   friend struct List;
+  template <typename U>
+  friend class Orphan;
   friend class Orphanage;
+  friend class MessageBuilder;
 };
 
 class Orphanage: private kj::DisallowConstCopy {
@@ -106,6 +115,8 @@ public:
 
   template <typename Reader>
   Orphan<FromReader<Reader>> newOrphanCopy(const Reader& copyFrom) const;
+  template <typename Reader>
+  Orphan<FromReader<Reader>> newOrphanCopy(Reader& copyFrom) const;
   // Allocate a new orphaned object (struct, list, or blob) and initialize it as a copy of the
   // given object.
 
@@ -139,6 +150,16 @@ struct OrphanGetImpl<T, Kind::STRUCT> {
   }
   static inline typename T::Reader applyReader(const _::OrphanBuilder& builder) {
     return typename T::Reader(builder.asStructReader(_::structSize<T>()));
+  }
+};
+
+template <typename T>
+struct OrphanGetImpl<T, Kind::INTERFACE> {
+  static inline typename T::Client apply(_::OrphanBuilder& builder) {
+    return typename T::Client(builder.asCapability());
+  }
+  static inline typename T::Client applyReader(const _::OrphanBuilder& builder) {
+    return typename T::Client(builder.asCapability());
   }
 };
 
@@ -185,12 +206,12 @@ struct OrphanGetImpl<Data, Kind::BLOB> {
 }  // namespace _ (private)
 
 template <typename T>
-inline typename T::Builder Orphan<T>::get() {
+inline BuilderFor<T> Orphan<T>::get() {
   return _::OrphanGetImpl<T>::apply(builder);
 }
 
 template <typename T>
-inline typename T::Reader Orphan<T>::getReader() const {
+inline ReaderFor<T> Orphan<T>::getReader() const {
   return _::OrphanGetImpl<T>::applyReader(builder);
 }
 
@@ -273,9 +294,13 @@ struct Orphanage::GetInnerReader<T, Kind::BLOB> {
 };
 
 template <typename Reader>
-Orphan<FromReader<Reader>> Orphanage::newOrphanCopy(const Reader& copyFrom) const {
+inline Orphan<FromReader<Reader>> Orphanage::newOrphanCopy(const Reader& copyFrom) const {
   return Orphan<FromReader<Reader>>(_::OrphanBuilder::copy(
       arena, GetInnerReader<FromReader<Reader>>::apply(copyFrom)));
+}
+template <typename Reader>
+inline Orphan<FromReader<Reader>> Orphanage::newOrphanCopy(Reader& copyFrom) const {
+  return newOrphanCopy(kj::implicitCast<const Reader&>(copyFrom));
 }
 
 }  // namespace capnp

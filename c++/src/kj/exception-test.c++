@@ -55,7 +55,7 @@ class ThrowingDestructor: public UnwindDetector {
 public:
   ~ThrowingDestructor() noexcept(false) {
     catchExceptionsIfUnwinding([]() {
-      KJ_FAIL_ASSERT("bar") { break; }
+      KJ_FAIL_ASSERT("this is a test, not a real bug") { break; }
     });
   }
 };
@@ -67,7 +67,7 @@ TEST(Exception, UnwindDetector) {
   });
 
   KJ_IF_MAYBE(ex, e) {
-    EXPECT_EQ("bar", ex->getDescription());
+    EXPECT_EQ("this is a test, not a real bug", ex->getDescription());
   } else {
     ADD_FAILURE() << "Expected exception";
   }
@@ -94,6 +94,40 @@ TEST(Exception, ExceptionCallbackMustBeOnStack) {
   EXPECT_ANY_THROW(new ExceptionCallback);
 #endif
 }
+
+#if !KJ_NO_EXCEPTIONS
+TEST(Exception, ScopeSuccessFail) {
+  bool success = false;
+  bool failure = false;
+
+  {
+    KJ_ON_SCOPE_SUCCESS(success = true);
+    KJ_ON_SCOPE_FAILURE(failure = true);
+
+    EXPECT_FALSE(success);
+    EXPECT_FALSE(failure);
+  }
+
+  EXPECT_TRUE(success);
+  EXPECT_FALSE(failure);
+
+  success = false;
+  failure = false;
+
+  try {
+    KJ_ON_SCOPE_SUCCESS(success = true);
+    KJ_ON_SCOPE_FAILURE(failure = true);
+
+    EXPECT_FALSE(success);
+    EXPECT_FALSE(failure);
+
+    throw 1;
+  } catch (int) {}
+
+  EXPECT_FALSE(success);
+  EXPECT_TRUE(failure);
+}
+#endif
 
 }  // namespace
 }  // namespace _ (private)

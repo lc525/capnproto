@@ -111,6 +111,7 @@ struct List<T, Kind::PRIMITIVE> {
 
     inline uint size() const { return reader.size() / ELEMENTS; }
     inline T operator[](uint index) const {
+      KJ_IREQUIRE(index < size());
       return reader.template getDataElement<T>(index * ELEMENTS);
     }
 
@@ -133,7 +134,8 @@ struct List<T, Kind::PRIMITIVE> {
   public:
     typedef List<T> Builds;
 
-    Builder() = default;
+    Builder() = delete;
+    inline Builder(decltype(nullptr)) {}
     inline explicit Builder(_::ListBuilder builder): builder(builder) {}
 
     inline operator Reader() { return Reader(builder.asReader()); }
@@ -141,6 +143,7 @@ struct List<T, Kind::PRIMITIVE> {
 
     inline uint size() const { return builder.size() / ELEMENTS; }
     inline T operator[](uint index) {
+      KJ_IREQUIRE(index < size());
       return builder.template getDataElement<T>(index * ELEMENTS);
     }
     inline void set(uint index, T value) {
@@ -165,31 +168,15 @@ struct List<T, Kind::PRIMITIVE> {
   };
 
 private:
-  inline static _::ListBuilder initAsElementOf(
-      _::ListBuilder& builder, uint index, uint size) {
-    return builder.initListElement(
-        index * ELEMENTS, _::ElementSizeForType<T>::value, size * ELEMENTS);
+  inline static _::ListBuilder initPointer(_::PointerBuilder builder, uint size) {
+    return builder.initList(_::elementSizeForType<T>(), size * ELEMENTS);
   }
-  inline static _::ListBuilder getAsElementOf(
-      _::ListBuilder& builder, uint index) {
-    return builder.getListElement(index * ELEMENTS, _::ElementSizeForType<T>::value);
+  inline static _::ListBuilder getFromPointer(_::PointerBuilder builder, const word* defaultValue) {
+    return builder.getList(_::elementSizeForType<T>(), defaultValue);
   }
-  inline static _::ListReader getAsElementOf(
-      const _::ListReader& reader, uint index) {
-    return reader.getListElement(index * ELEMENTS, _::ElementSizeForType<T>::value);
-  }
-
-  inline static _::ListBuilder initAsFieldOf(
-      _::StructBuilder& builder, WirePointerCount index, uint size) {
-    return builder.initListField(index, _::ElementSizeForType<T>::value, size * ELEMENTS);
-  }
-  inline static _::ListBuilder getAsFieldOf(
-      _::StructBuilder& builder, WirePointerCount index, const word* defaultValue) {
-    return builder.getListField(index, _::ElementSizeForType<T>::value, defaultValue);
-  }
-  inline static _::ListReader getAsFieldOf(
-      const _::StructReader& reader, WirePointerCount index, const word* defaultValue) {
-    return reader.getListField(index, _::ElementSizeForType<T>::value, defaultValue);
+  inline static _::ListReader getFromPointer(
+      const _::PointerReader& reader, const word* defaultValue) {
+    return reader.getList(_::elementSizeForType<T>(), defaultValue);
   }
 
   template <typename U, Kind k>
@@ -216,6 +203,7 @@ struct List<T, Kind::STRUCT> {
 
     inline uint size() const { return reader.size() / ELEMENTS; }
     inline typename T::Reader operator[](uint index) const {
+      KJ_IREQUIRE(index < size());
       return typename T::Reader(reader.getStructElement(index * ELEMENTS));
     }
 
@@ -238,7 +226,8 @@ struct List<T, Kind::STRUCT> {
   public:
     typedef List<T> Builds;
 
-    Builder() = default;
+    Builder() = delete;
+    inline Builder(decltype(nullptr)) {}
     inline explicit Builder(_::ListBuilder builder): builder(builder) {}
 
     inline operator Reader() { return Reader(builder.asReader()); }
@@ -246,6 +235,7 @@ struct List<T, Kind::STRUCT> {
 
     inline uint size() const { return builder.size() / ELEMENTS; }
     inline typename T::Builder operator[](uint index) {
+      KJ_IREQUIRE(index < size());
       return typename T::Builder(builder.getStructElement(index * ELEMENTS));
     }
 
@@ -259,12 +249,24 @@ struct List<T, Kind::STRUCT> {
       //   using a newer version of the schema that has additional fields -- it will be truncated,
       //   losing data.
 
+      KJ_IREQUIRE(index < size());
+
       // We pass a zero-valued StructSize to asStruct() because we do not want the struct to be
       // expanded under any circumstances.  We're just going to throw it away anyway, and
       // transferContentFrom() already carefully compares the struct sizes before transferring.
       builder.getStructElement(index * ELEMENTS).transferContentFrom(
           orphan.builder.asStruct(_::StructSize(
               0 * WORDS, 0 * POINTERS, _::FieldSize::VOID)));
+    }
+    inline void setWithCaveats(uint index, const typename T::Reader& reader) {
+      // Mostly behaves like you'd expect `set` to behave, but with a caveat originating from
+      // the fact that structs in a struct list are allocated inline rather than by pointer:
+      // If the source struct is larger than the target struct -- say, because the source was built
+      // using a newer version of the schema that has additional fields -- it will be truncated,
+      // losing data.
+
+      KJ_IREQUIRE(index < size());
+      builder.getStructElement(index * ELEMENTS).copyContentFrom(reader._reader);
     }
 
     // There are no init(), set(), adopt(), or disown() methods for lists of structs because the
@@ -284,31 +286,15 @@ struct List<T, Kind::STRUCT> {
   };
 
 private:
-  inline static _::ListBuilder initAsElementOf(
-      _::ListBuilder& builder, uint index, uint size) {
-    return builder.initStructListElement(
-        index * ELEMENTS, size * ELEMENTS, _::structSize<T>());
+  inline static _::ListBuilder initPointer(_::PointerBuilder builder, uint size) {
+    return builder.initStructList(size * ELEMENTS, _::structSize<T>());
   }
-  inline static _::ListBuilder getAsElementOf(
-      _::ListBuilder& builder, uint index) {
-    return builder.getStructListElement(index * ELEMENTS, _::structSize<T>());
+  inline static _::ListBuilder getFromPointer(_::PointerBuilder builder, const word* defaultValue) {
+    return builder.getStructList(_::structSize<T>(), defaultValue);
   }
-  inline static _::ListReader getAsElementOf(
-      const _::ListReader& reader, uint index) {
-    return reader.getListElement(index * ELEMENTS, _::FieldSize::INLINE_COMPOSITE);
-  }
-
-  inline static _::ListBuilder initAsFieldOf(
-      _::StructBuilder& builder, WirePointerCount index, uint size) {
-    return builder.initStructListField(index, size * ELEMENTS, _::structSize<T>());
-  }
-  inline static _::ListBuilder getAsFieldOf(
-      _::StructBuilder& builder, WirePointerCount index, const word* defaultValue) {
-    return builder.getStructListField(index, _::structSize<T>(), defaultValue);
-  }
-  inline static _::ListReader getAsFieldOf(
-      const _::StructReader& reader, WirePointerCount index, const word* defaultValue) {
-    return reader.getListField(index, _::FieldSize::INLINE_COMPOSITE, defaultValue);
+  inline static _::ListReader getFromPointer(
+      const _::PointerReader& reader, const word* defaultValue) {
+    return reader.getList(_::FieldSize::INLINE_COMPOSITE, defaultValue);
   }
 
   template <typename U, Kind k>
@@ -332,7 +318,9 @@ struct List<List<T>, Kind::LIST> {
 
     inline uint size() const { return reader.size() / ELEMENTS; }
     inline typename List<T>::Reader operator[](uint index) const {
-      return typename List<T>::Reader(List<T>::getAsElementOf(reader, index));
+      KJ_IREQUIRE(index < size());
+      return typename List<T>::Reader(
+          _::PointerHelpers<List<T>>::get(reader.getPointerElement(index * ELEMENTS)));
     }
 
     typedef _::IndexingIterator<const Reader, typename List<T>::Reader> Iterator;
@@ -354,7 +342,8 @@ struct List<List<T>, Kind::LIST> {
   public:
     typedef List<List<T>> Builds;
 
-    Builder() = default;
+    Builder() = delete;
+    inline Builder(decltype(nullptr)) {}
     inline explicit Builder(_::ListBuilder builder): builder(builder) {}
 
     inline operator Reader() { return Reader(builder.asReader()); }
@@ -362,15 +351,21 @@ struct List<List<T>, Kind::LIST> {
 
     inline uint size() const { return builder.size() / ELEMENTS; }
     inline typename List<T>::Builder operator[](uint index) {
-      return typename List<T>::Builder(List<T>::getAsElementOf(builder, index));
+      KJ_IREQUIRE(index < size());
+      return typename List<T>::Builder(
+          _::PointerHelpers<List<T>>::get(builder.getPointerElement(index * ELEMENTS)));
     }
     inline typename List<T>::Builder init(uint index, uint size) {
-      return typename List<T>::Builder(List<T>::initAsElementOf(builder, index, size));
+      KJ_IREQUIRE(index < this->size());
+      return typename List<T>::Builder(
+          _::PointerHelpers<List<T>>::init(builder.getPointerElement(index * ELEMENTS), size));
     }
     inline void set(uint index, typename List<T>::Reader value) {
-      builder.setListElement(index * ELEMENTS, value.reader);
+      KJ_IREQUIRE(index < size());
+      builder.getPointerElement(index * ELEMENTS).setList(value.reader);
     }
     void set(uint index, std::initializer_list<ReaderFor<T>> value) {
+      KJ_IREQUIRE(index < size());
       auto l = init(index, value.size());
       uint i = 0;
       for (auto& element: value) {
@@ -378,10 +373,12 @@ struct List<List<T>, Kind::LIST> {
       }
     }
     inline void adopt(uint index, Orphan<T>&& value) {
-      builder.adopt(index * ELEMENTS, kj::mv(value));
+      KJ_IREQUIRE(index < size());
+      builder.getPointerElement(index * ELEMENTS).adopt(kj::mv(value));
     }
     inline Orphan<T> disown(uint index) {
-      return Orphan<T>(builder.disown(index * ELEMENTS));
+      KJ_IREQUIRE(index < size());
+      return Orphan<T>(builder.getPointerElement(index * ELEMENTS).disown());
     }
 
     typedef _::IndexingIterator<Builder, typename List<T>::Builder> Iterator;
@@ -396,31 +393,15 @@ struct List<List<T>, Kind::LIST> {
   };
 
 private:
-  inline static _::ListBuilder initAsElementOf(
-      _::ListBuilder& builder, uint index, uint size) {
-    return builder.initListElement(
-        index * ELEMENTS, _::FieldSize::POINTER, size * ELEMENTS);
+  inline static _::ListBuilder initPointer(_::PointerBuilder builder, uint size) {
+    return builder.initList(_::FieldSize::POINTER, size * ELEMENTS);
   }
-  inline static _::ListBuilder getAsElementOf(
-      _::ListBuilder& builder, uint index) {
-    return builder.getListElement(index * ELEMENTS, _::FieldSize::POINTER);
+  inline static _::ListBuilder getFromPointer(_::PointerBuilder builder, const word* defaultValue) {
+    return builder.getList(_::FieldSize::POINTER, defaultValue);
   }
-  inline static _::ListReader getAsElementOf(
-      const _::ListReader& reader, uint index) {
-    return reader.getListElement(index * ELEMENTS, _::FieldSize::POINTER);
-  }
-
-  inline static _::ListBuilder initAsFieldOf(
-      _::StructBuilder& builder, WirePointerCount index, uint size) {
-    return builder.initListField(index, _::FieldSize::POINTER, size * ELEMENTS);
-  }
-  inline static _::ListBuilder getAsFieldOf(
-      _::StructBuilder& builder, WirePointerCount index, const word* defaultValue) {
-    return builder.getListField(index, _::FieldSize::POINTER, defaultValue);
-  }
-  inline static _::ListReader getAsFieldOf(
-      const _::StructReader& reader, WirePointerCount index, const word* defaultValue) {
-    return reader.getListField(index, _::FieldSize::POINTER, defaultValue);
+  inline static _::ListReader getFromPointer(
+      const _::PointerReader& reader, const word* defaultValue) {
+    return reader.getList(_::FieldSize::POINTER, defaultValue);
   }
 
   template <typename U, Kind k>
@@ -442,7 +423,8 @@ struct List<T, Kind::BLOB> {
 
     inline uint size() const { return reader.size() / ELEMENTS; }
     inline typename T::Reader operator[](uint index) const {
-      return reader.getBlobElement<T>(index * ELEMENTS);
+      KJ_IREQUIRE(index < size());
+      return reader.getPointerElement(index * ELEMENTS).template getBlob<T>(nullptr, 0 * BYTES);
     }
 
     typedef _::IndexingIterator<const Reader, typename T::Reader> Iterator;
@@ -464,7 +446,8 @@ struct List<T, Kind::BLOB> {
   public:
     typedef List<T> Builds;
 
-    Builder() = default;
+    Builder() = delete;
+    inline Builder(decltype(nullptr)) {}
     inline explicit Builder(_::ListBuilder builder): builder(builder) {}
 
     inline operator Reader() { return Reader(builder.asReader()); }
@@ -472,19 +455,24 @@ struct List<T, Kind::BLOB> {
 
     inline uint size() const { return builder.size() / ELEMENTS; }
     inline typename T::Builder operator[](uint index) {
-      return builder.getBlobElement<T>(index * ELEMENTS);
+      KJ_IREQUIRE(index < size());
+      return builder.getPointerElement(index * ELEMENTS).template getBlob<T>(nullptr, 0 * BYTES);
     }
     inline void set(uint index, typename T::Reader value) {
-      builder.setBlobElement<T>(index * ELEMENTS, value);
+      KJ_IREQUIRE(index < size());
+      builder.getPointerElement(index * ELEMENTS).template setBlob<T>(value);
     }
     inline typename T::Builder init(uint index, uint size) {
-      return builder.initBlobElement<T>(index * ELEMENTS, size * BYTES);
+      KJ_IREQUIRE(index < this->size());
+      return builder.getPointerElement(index * ELEMENTS).template initBlob<T>(size * BYTES);
     }
     inline void adopt(uint index, Orphan<T>&& value) {
-      builder.adopt(index * ELEMENTS, kj::mv(value));
+      KJ_IREQUIRE(index < size());
+      builder.getPointerElement(index * ELEMENTS).adopt(kj::mv(value));
     }
     inline Orphan<T> disown(uint index) {
-      return Orphan<T>(builder.disown(index * ELEMENTS));
+      KJ_IREQUIRE(index < size());
+      return Orphan<T>(builder.getPointerElement(index * ELEMENTS).disown());
     }
 
     typedef _::IndexingIterator<Builder, typename T::Builder> Iterator;
@@ -499,31 +487,15 @@ struct List<T, Kind::BLOB> {
   };
 
 private:
-  inline static _::ListBuilder initAsElementOf(
-      _::ListBuilder& builder, uint index, uint size) {
-    return builder.initListElement(
-        index * ELEMENTS, _::FieldSize::POINTER, size * ELEMENTS);
+  inline static _::ListBuilder initPointer(_::PointerBuilder builder, uint size) {
+    return builder.initList(_::FieldSize::POINTER, size * ELEMENTS);
   }
-  inline static _::ListBuilder getAsElementOf(
-      _::ListBuilder& builder, uint index) {
-    return builder.getListElement(index * ELEMENTS, _::FieldSize::POINTER);
+  inline static _::ListBuilder getFromPointer(_::PointerBuilder builder, const word* defaultValue) {
+    return builder.getList(_::FieldSize::POINTER, defaultValue);
   }
-  inline static _::ListReader getAsElementOf(
-      const _::ListReader& reader, uint index) {
-    return reader.getListElement(index * ELEMENTS, _::FieldSize::POINTER);
-  }
-
-  inline static _::ListBuilder initAsFieldOf(
-      _::StructBuilder& builder, WirePointerCount index, uint size) {
-    return builder.initListField(index, _::FieldSize::POINTER, size * ELEMENTS);
-  }
-  inline static _::ListBuilder getAsFieldOf(
-      _::StructBuilder& builder, WirePointerCount index, const word* defaultValue) {
-    return builder.getListField(index, _::FieldSize::POINTER, defaultValue);
-  }
-  inline static _::ListReader getAsFieldOf(
-      const _::StructReader& reader, WirePointerCount index, const word* defaultValue) {
-    return reader.getListField(index, _::FieldSize::POINTER, defaultValue);
+  inline static _::ListReader getFromPointer(
+      const _::PointerReader& reader, const word* defaultValue) {
+    return reader.getList(_::FieldSize::POINTER, defaultValue);
   }
 
   template <typename U, Kind k>

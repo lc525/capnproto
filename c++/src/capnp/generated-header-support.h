@@ -29,7 +29,10 @@
 #include "layout.h"
 #include "list.h"
 #include "orphan.h"
+#include "pointer-helpers.h"
+#include "any.h"
 #include <kj/string.h>
+#include <kj/string-tree.h>
 
 namespace capnp {
 
@@ -42,106 +45,6 @@ struct DynamicStruct;  // So that it can be declared a friend.
 
 namespace _ {  // private
 
-template <typename T>
-struct PointerHelpers<T, Kind::STRUCT> {
-  static inline typename T::Reader get(StructReader reader, WirePointerCount index,
-                                       const word* defaultValue = nullptr) {
-    return typename T::Reader(reader.getStructField(index, defaultValue));
-  }
-  static inline typename T::Builder get(StructBuilder builder, WirePointerCount index,
-                                        const word* defaultValue = nullptr) {
-    return typename T::Builder(builder.getStructField(index, structSize<T>(), defaultValue));
-  }
-  static inline void set(StructBuilder builder, WirePointerCount index,
-                         typename T::Reader value) {
-    builder.setStructField(index, value._reader);
-  }
-  static inline typename T::Builder init(StructBuilder builder, WirePointerCount index) {
-    return typename T::Builder(builder.initStructField(index, structSize<T>()));
-  }
-  static inline void adopt(StructBuilder builder, WirePointerCount index, Orphan<T>&& value) {
-    builder.adopt(index, kj::mv(value.builder));
-  }
-  static inline Orphan<T> disown(StructBuilder builder, WirePointerCount index) {
-    return Orphan<T>(builder.disown(index));
-  }
-};
-
-template <typename T>
-struct PointerHelpers<List<T>, Kind::LIST> {
-  static inline typename List<T>::Reader get(StructReader reader, WirePointerCount index,
-                                             const word* defaultValue = nullptr) {
-    return typename List<T>::Reader(List<T>::getAsFieldOf(reader, index, defaultValue));
-  }
-  static inline typename List<T>::Builder get(StructBuilder builder, WirePointerCount index,
-                                              const word* defaultValue = nullptr) {
-    return typename List<T>::Builder(List<T>::getAsFieldOf(builder, index, defaultValue));
-  }
-  static inline void set(StructBuilder builder, WirePointerCount index,
-                         typename List<T>::Reader value) {
-    builder.setListField(index, value.reader);
-  }
-  template <typename U>
-  static void set(StructBuilder builder, WirePointerCount index, std::initializer_list<U> value) {
-    auto l = init(builder, index, value.size());
-    uint i = 0;
-    for (auto& element: value) {
-      l.set(i++, element);
-    }
-  }
-  static inline typename List<T>::Builder init(
-      StructBuilder builder, WirePointerCount index, uint size) {
-    return typename List<T>::Builder(List<T>::initAsFieldOf(builder, index, size));
-  }
-  static inline void adopt(StructBuilder builder, WirePointerCount index, Orphan<List<T>>&& value) {
-    builder.adopt(index, kj::mv(value.builder));
-  }
-  static inline Orphan<List<T>> disown(StructBuilder builder, WirePointerCount index) {
-    return Orphan<List<T>>(builder.disown(index));
-  }
-};
-
-template <typename T>
-struct PointerHelpers<T, Kind::BLOB> {
-  static inline typename T::Reader get(StructReader reader, WirePointerCount index,
-                                       const void* defaultValue = nullptr,
-                                       uint defaultBytes = 0) {
-    return reader.getBlobField<T>(index, defaultValue, defaultBytes * BYTES);
-  }
-  static inline typename T::Builder get(StructBuilder builder, WirePointerCount index,
-                                        const void* defaultValue = nullptr,
-                                        uint defaultBytes = 0) {
-    return builder.getBlobField<T>(index, defaultValue, defaultBytes * BYTES);
-  }
-  static inline void set(StructBuilder builder, WirePointerCount index, typename T::Reader value) {
-    builder.setBlobField<T>(index, value);
-  }
-  static inline typename T::Builder init(StructBuilder builder, WirePointerCount index, uint size) {
-    return builder.initBlobField<T>(index, size * BYTES);
-  }
-  static inline void adopt(StructBuilder builder, WirePointerCount index, Orphan<T>&& value) {
-    builder.adopt(index, kj::mv(value.builder));
-  }
-  static inline Orphan<T> disown(StructBuilder builder, WirePointerCount index) {
-    return Orphan<T>(builder.disown(index));
-  }
-};
-
-struct UncheckedMessage {
-  typedef const word* Reader;
-};
-
-template <>
-struct PointerHelpers<UncheckedMessage> {
-  // Reads an Object field as an unchecked message pointer.  Requires that the containing message is
-  // itself unchecked.  This hack is currently private.  It is used to locate default values within
-  // encoded schemas.
-
-  static inline const word* get(StructReader reader, WirePointerCount index) {
-    return reader.getUncheckedPointer(index);
-  }
-};
-
 struct RawSchema {
   // The generated code defines a constant RawSchema for every compiled declaration.
   //
@@ -152,6 +55,9 @@ struct RawSchema {
   const word* encodedNode;
   // Encoded SchemaNode, readable via readMessageUnchecked<schema::Node>(encodedNode).
 
+  uint32_t encodedSize;
+  // Size of encodedNode, in words.
+
   const RawSchema* const* dependencies;
   // Pointers to other types on which this one depends, sorted by ID.  The schemas in this table
   // may be uninitialized -- you must call ensureInitialized() on the one you wish to use before
@@ -159,18 +65,17 @@ struct RawSchema {
   //
   // TODO(someday):  Make this a hashtable.
 
-  struct MemberInfo {
-    uint16_t unionIndex;  // 0 = not in a union, >0 = parent union's index + 1
-    uint16_t index;       // index of the member
-  };
-
-  const MemberInfo* membersByName;
+  const uint16_t* membersByName;
   // Indexes of members sorted by name.  Used to implement name lookup.
   // TODO(someday):  Make this a hashtable.
 
   uint32_t dependencyCount;
   uint32_t memberCount;
   // Sizes of above tables.
+
+  const uint16_t* membersByDiscriminant;
+  // List of all member indexes ordered by discriminant value.  Those which don't have a
+  // discriminant value are listed at the end, in order by ordinal.
 
   const RawSchema* canCastTo;
   // Points to the RawSchema of a compiled-in type to which it is safe to cast any DynamicValue
@@ -203,8 +108,13 @@ inline const RawSchema& rawSchema() {
   return RawSchema_<T>::get();
 }
 
-template <typename T>
-struct TypeId_;
+template <typename T> struct TypeId_;
+
+extern const RawSchema NULL_INTERFACE_SCHEMA;  // defined in schema.c++
+template <> struct TypeId_<Capability> { static constexpr uint64_t typeId = 0x03; };
+template <> struct RawSchema_<Capability> {
+  static inline const RawSchema& get() { return NULL_INTERFACE_SCHEMA; }
+};
 
 template <typename T>
 struct UnionMemberIndex_;
@@ -216,20 +126,91 @@ struct UnionParentType_;
 template <typename T>
 using UnionParentType = typename UnionParentType_<T>::Type;
 
-kj::String structString(StructReader reader, const RawSchema& schema);
-kj::String unionString(StructReader reader, const RawSchema& schema, uint memberIndex);
+kj::StringTree structString(StructReader reader, const RawSchema& schema);
 // Declared here so that we can declare inline stringify methods on generated types.
 // Defined in stringify.c++, which depends on dynamic.c++, which is allowed not to be linked in.
 
 template <typename T>
-inline kj::String structString(StructReader reader) {
+inline kj::StringTree structString(StructReader reader) {
   return structString(reader, rawSchema<T>());
 }
 
+// TODO(cleanup):  Unify ConstStruct and ConstList.
 template <typename T>
-inline kj::String unionString(StructReader reader) {
-  return unionString(reader, rawSchema<UnionParentType<T>>(), unionMemberIndex<T>());
-}
+class ConstStruct {
+public:
+  ConstStruct() = delete;
+  KJ_DISALLOW_COPY(ConstStruct);
+  inline explicit constexpr ConstStruct(const word* ptr): ptr(ptr) {}
+
+  inline typename T::Reader get() const {
+    return AnyPointer::Reader(PointerReader::getRootUnchecked(ptr)).getAs<T>();
+  }
+
+  inline operator typename T::Reader() const { return get(); }
+  inline typename T::Reader operator*() const { return get(); }
+  inline TemporaryPointer<typename T::Reader> operator->() const { return get(); }
+
+private:
+  const word* ptr;
+};
+
+template <typename T>
+class ConstList {
+public:
+  ConstList() = delete;
+  KJ_DISALLOW_COPY(ConstList);
+  inline explicit constexpr ConstList(const word* ptr): ptr(ptr) {}
+
+  inline typename List<T>::Reader get() const {
+    return AnyPointer::Reader(PointerReader::getRootUnchecked(ptr)).getAs<List<T>>();
+  }
+
+  inline operator typename List<T>::Reader() const { return get(); }
+  inline typename List<T>::Reader operator*() const { return get(); }
+  inline TemporaryPointer<typename List<T>::Reader> operator->() const { return get(); }
+
+private:
+  const word* ptr;
+};
+
+template <size_t size>
+class ConstText {
+public:
+  ConstText() = delete;
+  KJ_DISALLOW_COPY(ConstText);
+  inline explicit constexpr ConstText(const word* ptr): ptr(ptr) {}
+
+  inline Text::Reader get() const {
+    return Text::Reader(reinterpret_cast<const char*>(ptr), size);
+  }
+
+  inline operator Text::Reader() const { return get(); }
+  inline Text::Reader operator*() const { return get(); }
+  inline TemporaryPointer<Text::Reader> operator->() const { return get(); }
+
+private:
+  const word* ptr;
+};
+
+template <size_t size>
+class ConstData {
+public:
+  ConstData() = delete;
+  KJ_DISALLOW_COPY(ConstData);
+  inline explicit constexpr ConstData(const word* ptr): ptr(ptr) {}
+
+  inline Data::Reader get() const {
+    return Data::Reader(reinterpret_cast<const byte*>(ptr), size);
+  }
+
+  inline operator Data::Reader() const { return get(); }
+  inline Data::Reader operator*() const { return get(); }
+  inline TemporaryPointer<Data::Reader> operator->() const { return get(); }
+
+private:
+  const word* ptr;
+};
 
 }  // namespace _ (private)
 
@@ -237,6 +218,15 @@ template <typename T>
 inline constexpr uint64_t typeId() { return _::TypeId_<T>::typeId; }
 // typeId<MyType>() returns the type ID as defined in the schema.  Works with structs, enums, and
 // interfaces.
+
+template <typename T>
+inline constexpr uint sizeInWords() {
+  // Return the size, in words, of a Struct type, if allocated free-standing (not in a list).
+  // May be useful for pre-computing space needed in order to precisely allocate messages.
+
+  return (WordCount32(_::structSize<T>().data) +
+      _::structSize<T>().pointers * WORDS_PER_POINTER) / WORDS;
+}
 
 }  // namespace capnp
 
@@ -248,7 +238,7 @@ inline constexpr uint64_t typeId() { return _::TypeId_<T>::typeId; }
     }
 #define CAPNP_DEFINE_ENUM(type) \
     constexpr Kind Kind_<type>::kind; \
-    constexpr uint64_t TypeId_<type>::typeId;
+    constexpr uint64_t TypeId_<type>::typeId
 
 #define CAPNP_DECLARE_STRUCT(type, id, dataWordSize, pointerCount, preferredElementEncoding) \
     template <> struct Kind_<type> { static constexpr Kind kind = Kind::STRUCT; }; \
@@ -263,7 +253,7 @@ inline constexpr uint64_t typeId() { return _::TypeId_<T>::typeId; }
 #define CAPNP_DEFINE_STRUCT(type) \
     constexpr Kind Kind_<type>::kind; \
     constexpr StructSize StructSize_<type>::value; \
-    constexpr uint64_t TypeId_<type>::typeId;
+    constexpr uint64_t TypeId_<type>::typeId
 
 #define CAPNP_DECLARE_UNION(type, parentType, memberIndex) \
     template <> struct Kind_<type> { static constexpr Kind kind = Kind::UNION; }; \
@@ -271,7 +261,7 @@ inline constexpr uint64_t typeId() { return _::TypeId_<T>::typeId; }
     template <> struct UnionParentType_<type> { typedef parentType Type; }
 #define CAPNP_DEFINE_UNION(type) \
     constexpr Kind Kind_<type>::kind; \
-    constexpr uint UnionMemberIndex_<type>::value;
+    constexpr uint UnionMemberIndex_<type>::value
 
 #define CAPNP_DECLARE_INTERFACE(type, id) \
     template <> struct Kind_<type> { static constexpr Kind kind = Kind::INTERFACE; }; \
@@ -281,6 +271,6 @@ inline constexpr uint64_t typeId() { return _::TypeId_<T>::typeId; }
     }
 #define CAPNP_DEFINE_INTERFACE(type) \
     constexpr Kind Kind_<type>::kind; \
-    constexpr uint64_t TypeId_<type>::typeId;
+    constexpr uint64_t TypeId_<type>::typeId
 
 #endif  // CAPNP_GENERATED_HEADER_SUPPORT_H_

@@ -33,6 +33,14 @@ namespace kj {
 class StringPtr;
 class String;
 
+class StringTree;   // string-tree.h
+
+// Our STL string SFINAE trick does not work with GCC 4.7, but it works with Clang and GCC 4.8, so
+// we'll just preprocess it out if not supported.
+#if __clang__ || __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 8)
+#define KJ_COMPILER_SUPPORTS_STL_STRING_INTEROP 1
+#endif
+
 // =======================================================================================
 // StringPtr -- A NUL-terminated ArrayPtr<const char> containing UTF-8 text.
 //
@@ -50,6 +58,20 @@ public:
   }
   inline StringPtr(const char* begin, const char* end): StringPtr(begin, end - begin) {}
   inline StringPtr(const String& value);
+
+#if KJ_COMPILER_SUPPORTS_STL_STRING_INTEROP
+  template <typename T, typename = decltype(instance<T>().c_str())>
+  inline StringPtr(const T& t): StringPtr(t.c_str()) {}
+  // Allow implicit conversion from any class that has a c_str() method (namely, std::string).
+  // We use a template trick to detect std::string in order to avoid including the header for
+  // those who don't want it.
+
+  template <typename T, typename = decltype(instance<T>().c_str())>
+  inline operator T() const { return cStr(); }
+  // Allow implicit conversion to any class that has a c_str() method (namely, std::string).
+  // We use a template trick to detect std::string in order to avoid including the header for
+  // those who don't want it.
+#endif
 
   inline operator ArrayPtr<const char>() const;
   inline ArrayPtr<const char> asArray() const;
@@ -84,6 +106,9 @@ public:
   inline bool startsWith(const StringPtr& other) const;
   inline bool endsWith(const StringPtr& other) const;
 
+  inline Maybe<size_t> findFirst(char c) const;
+  inline Maybe<size_t> findLast(char c) const;
+
 private:
   inline StringPtr(ArrayPtr<const char> content): content(content) {}
 
@@ -109,6 +134,8 @@ public:
   inline String(decltype(nullptr)): content(nullptr) {}
   inline String(char* value, size_t size, const ArrayDisposer& disposer);
   // Does not copy.  `size` does not include NUL terminator, but `value` must be NUL-terminated.
+  inline explicit String(Array<char> buffer);
+  // Does not copy.  Requires `buffer` ends with `\0`.
 
   inline operator ArrayPtr<char>();
   inline operator ArrayPtr<const char>() const;
@@ -143,6 +170,9 @@ public:
     return StringPtr(*this).slice(start, end);
   }
 
+  inline Maybe<size_t> findFirst(char c) const { return StringPtr(*this).findFirst(c); }
+  inline Maybe<size_t> findLast(char c) const { return StringPtr(*this).findLast(c); }
+
 private:
   Array<char> content;
 };
@@ -176,6 +206,12 @@ inline size_t sum(std::initializer_list<size_t> nums) {
 }
 
 inline char* fill(char* ptr) { return ptr; }
+
+template <typename... Rest>
+char* fill(char* __restrict__ target, const StringTree& first, Rest&&... rest);
+// Make str() work with stringifiers that return StringTree by patching fill().
+//
+// Defined in string-tree.h.
 
 template <typename First, typename... Rest>
 char* fill(char* __restrict__ target, const First& first, Rest&&... rest) {
@@ -223,6 +259,9 @@ struct Stringifier {
   inline ArrayPtr<const char> operator*(const String& s) const { return s.asArray(); }
   inline ArrayPtr<const char> operator*(const StringPtr& s) const { return s.asArray(); }
 
+  inline Range<char> operator*(const Range<char>& r) const { return r; }
+  inline Repeat<char> operator*(const Repeat<char>& r) const { return r; }
+
   inline FixedArray<char, 1> operator*(char c) const {
     FixedArray<char, 1> result;
     result[0] = c;
@@ -231,22 +270,24 @@ struct Stringifier {
 
   StringPtr operator*(bool b) const;
 
-  CappedArray<char, sizeof(short) * 4> operator*(short i) const;
-  CappedArray<char, sizeof(unsigned short) * 4> operator*(unsigned short i) const;
-  CappedArray<char, sizeof(int) * 4> operator*(int i) const;
-  CappedArray<char, sizeof(unsigned int) * 4> operator*(unsigned int i) const;
-  CappedArray<char, sizeof(long) * 4> operator*(long i) const;
-  CappedArray<char, sizeof(unsigned long) * 4> operator*(unsigned long i) const;
-  CappedArray<char, sizeof(long long) * 4> operator*(long long i) const;
-  CappedArray<char, sizeof(unsigned long long) * 4> operator*(unsigned long long i) const;
+  CappedArray<char, 5> operator*(signed char i) const;
+  CappedArray<char, 5> operator*(unsigned char i) const;
+  CappedArray<char, sizeof(short) * 3 + 2> operator*(short i) const;
+  CappedArray<char, sizeof(unsigned short) * 3 + 2> operator*(unsigned short i) const;
+  CappedArray<char, sizeof(int) * 3 + 2> operator*(int i) const;
+  CappedArray<char, sizeof(unsigned int) * 3 + 2> operator*(unsigned int i) const;
+  CappedArray<char, sizeof(long) * 3 + 2> operator*(long i) const;
+  CappedArray<char, sizeof(unsigned long) * 3 + 2> operator*(unsigned long i) const;
+  CappedArray<char, sizeof(long long) * 3 + 2> operator*(long long i) const;
+  CappedArray<char, sizeof(unsigned long long) * 3 + 2> operator*(unsigned long long i) const;
   CappedArray<char, 24> operator*(float f) const;
   CappedArray<char, 32> operator*(double f) const;
-  CappedArray<char, sizeof(const void*) * 4> operator*(const void* s) const;
+  CappedArray<char, sizeof(const void*) * 3 + 2> operator*(const void* s) const;
 
   template <typename T>
-  Array<char> operator*(ArrayPtr<T> arr) const;
+  String operator*(ArrayPtr<T> arr) const;
   template <typename T>
-  Array<char> operator*(const Array<T>& arr) const;
+  String operator*(const Array<T>& arr) const;
 };
 static constexpr Stringifier STR = Stringifier();
 
@@ -265,10 +306,11 @@ auto toCharSequence(T&& value) -> decltype(_::STR * kj::fwd<T>(value)) {
   return _::STR * kj::fwd<T>(value);
 }
 
-CappedArray<char, sizeof(unsigned short) * 4> hex(unsigned short i);
-CappedArray<char, sizeof(unsigned int) * 4> hex(unsigned int i);
-CappedArray<char, sizeof(unsigned long) * 4> hex(unsigned long i);
-CappedArray<char, sizeof(unsigned long long) * 4> hex(unsigned long long i);
+CappedArray<char, sizeof(unsigned char) * 2 + 1> hex(unsigned char i);
+CappedArray<char, sizeof(unsigned short) * 2 + 1> hex(unsigned short i);
+CappedArray<char, sizeof(unsigned int) * 2 + 1> hex(unsigned int i);
+CappedArray<char, sizeof(unsigned long) * 2 + 1> hex(unsigned long i);
+CappedArray<char, sizeof(unsigned long long) * 2 + 1> hex(unsigned long long i);
 
 template <typename... Params>
 String str(Params&&... params) {
@@ -310,12 +352,12 @@ String strArray(T&& arr, const char* delim) {
 namespace _ {  // private
 
 template <typename T>
-inline Array<char> Stringifier::operator*(ArrayPtr<T> arr) const {
+inline String Stringifier::operator*(ArrayPtr<T> arr) const {
   return strArray(arr, ", ");
 }
 
 template <typename T>
-inline Array<char> Stringifier::operator*(const Array<T>& arr) const {
+inline String Stringifier::operator*(const Array<T>& arr) const {
   return strArray(arr, ", ");
 }
 
@@ -373,6 +415,24 @@ inline bool StringPtr::endsWith(const StringPtr& other) const {
       memcmp(end() - other.size(), other.content.begin(), other.size()) == 0;
 }
 
+inline Maybe<size_t> StringPtr::findFirst(char c) const {
+  const char* pos = reinterpret_cast<const char*>(memchr(content.begin(), c, size()));
+  if (pos == nullptr) {
+    return nullptr;
+  } else {
+    return pos - content.begin();
+  }
+}
+
+inline Maybe<size_t> StringPtr::findLast(char c) const {
+  for (size_t i = size(); i > 0; --i) {
+    if (content[i-1] == c) {
+      return i-1;
+    }
+  }
+  return nullptr;
+}
+
 inline String::operator ArrayPtr<char>() {
   return content == nullptr ? ArrayPtr<char>(nullptr) : content.slice(0, content.size() - 1);
 }
@@ -402,6 +462,10 @@ inline const char* String::end() const { return content == nullptr ? nullptr : c
 inline String::String(char* value, size_t size, const ArrayDisposer& disposer)
     : content(value, size + 1, disposer) {
   KJ_IREQUIRE(value[size] == '\0', "String must be NUL-terminated.");
+}
+
+inline String::String(Array<char> buffer): content(kj::mv(buffer)) {
+  KJ_IREQUIRE(content.size() > 0 && content.back() == '\0', "String must be NUL-terminated.");
 }
 
 inline String heapString(const char* value) {

@@ -28,20 +28,25 @@
 #error "This header is only meant to be included by Cap'n Proto's own source code."
 #endif
 
-#include <vector>
 #include <unordered_map>
 #include <kj/common.h>
 #include <kj/mutex.h>
+#include <kj/exception.h>
+#include <kj/vector.h>
 #include "common.h"
 #include "message.h"
+#include "layout.h"
+#include "capability.h"
 
 namespace capnp {
+
+class ClientHook;
+
 namespace _ {  // private
 
 class SegmentReader;
 class SegmentBuilder;
 class Arena;
-class ReaderArena;
 class BuilderArena;
 class ReadLimiter;
 
@@ -86,6 +91,14 @@ private:
   // the purpose of this class.  See class comment.)
 
   KJ_DISALLOW_COPY(ReadLimiter);
+};
+
+class BrokenCapFactory {
+  // Callback for constructing broken caps.  We use this so that we can avoid arena.c++ having a
+  // link-time dependency on capability code that lives in libcapnp-rpc.
+
+public:
+  virtual kj::Own<ClientHook> newBrokenCap(kj::StringPtr description) = 0;
 };
 
 class SegmentReader {
@@ -134,6 +147,8 @@ public:
 
 private:
   word* pos;
+  // Pointer to a pointer to the current end point of the segment, i.e. the location where the
+  // next object should be allocated.
 
   KJ_DISALLOW_COPY(SegmentBuilder);
 };
@@ -147,10 +162,11 @@ public:
 
   virtual void reportReadLimitReached() = 0;
   // Called to report that the read limit has been reached.  See ReadLimiter, below.  This invokes
-  // the VALIDATE_INPUT() macro which may throw an exception; if it return normally, the caller
+  // the VALIDATE_INPUT() macro which may throw an exception; if it returns normally, the caller
   // will need to continue with default values.
 
-  // TODO(someday):  Methods to deal with bundled capabilities.
+  virtual kj::Maybe<kj::Own<ClientHook>> extractCap(uint index) = 0;
+  // Extract the capability at the given index.  If the index is invalid, returns null.
 };
 
 class ReaderArena final: public Arena {
@@ -159,28 +175,54 @@ public:
   ~ReaderArena() noexcept(false);
   KJ_DISALLOW_COPY(ReaderArena);
 
+  inline void initCapTable(kj::Array<kj::Maybe<kj::Own<ClientHook>>> capTable) {
+    // Imbues the arena with a capability table.  This is not passed to the constructor because the
+    // table itself may be built based on some other part of the message (as is the case with the
+    // RPC protocol).
+    this->capTable = kj::mv(capTable);
+  }
+
   // implements Arena ------------------------------------------------
   SegmentReader* tryGetSegment(SegmentId id) override;
   void reportReadLimitReached() override;
+  kj::Maybe<kj::Own<ClientHook>> extractCap(uint index);
 
 private:
   MessageReader* message;
   ReadLimiter readLimiter;
+  kj::Array<kj::Maybe<kj::Own<ClientHook>>> capTable;
 
   // Optimize for single-segment messages so that small messages are handled quickly.
   SegmentReader segment0;
 
   typedef std::unordered_map<uint, kj::Own<SegmentReader>> SegmentMap;
-  kj::Maybe<kj::Own<SegmentMap>> moreSegments;
+  kj::MutexGuarded<kj::Maybe<kj::Own<SegmentMap>>> moreSegments;
+  // We need to mutex-guard the segment map because we lazily initialize segments when they are
+  // first requested, but a Reader is allowed to be used concurrently in multiple threads.  Luckily
+  // this only applies to large messages.
+  //
+  // TODO(perf):  Thread-local thing instead?  Some kind of lockless map?  Or do sharing of data
+  //   in a different way, where you have to construct a new MessageReader in each thread (but
+  //   possibly backed by the same data)?
 };
 
 class BuilderArena final: public Arena {
+  // A BuilderArena that does not allow the injection of capabilities.
+
 public:
   BuilderArena(MessageBuilder* message);
   ~BuilderArena() noexcept(false);
   KJ_DISALLOW_COPY(BuilderArena);
 
   inline SegmentBuilder* getRootSegment() { return &segment0; }
+
+  kj::ArrayPtr<const kj::ArrayPtr<const word>> getSegmentsForOutput();
+  // Get an array of all the segments, suitable for writing out.  This only returns the allocated
+  // portion of each segment, whereas tryGetSegment() returns something that includes
+  // not-yet-allocated space.
+
+  inline kj::ArrayPtr<kj::Maybe<kj::Own<ClientHook>>> getCapTable() { return capTable; }
+  // Return the capability table.
 
   SegmentBuilder* getSegment(SegmentId id);
   // Get the segment with the given id.  Crashes or throws an exception if no such segment exists.
@@ -196,36 +238,38 @@ public:
   // the arena is guaranteed to succeed.  Therefore callers should try to allocate from a specific
   // segment first if there is one, then fall back to the arena.
 
-  kj::ArrayPtr<const kj::ArrayPtr<const word>> getSegmentsForOutput();
-  // Get an array of all the segments, suitable for writing out.  This only returns the allocated
-  // portion of each segment, whereas tryGetSegment() returns something that includes
-  // not-yet-allocated space.
+  uint injectCap(kj::Own<ClientHook>&& cap);
+  // Add the capability to the message and return its index.  If the same ClientHook is injected
+  // twice, this may return the same index both times, but in this case dropCap() needs to be
+  // called an equal number of times to actually remove the cap.
 
-  // TODO(someday):  Methods to deal with bundled capabilities.
+  void dropCap(uint index);
+  // Remove a capability injected earlier.  Called when the pointer is overwritten or zero'd out.
 
   // implements Arena ------------------------------------------------
   SegmentReader* tryGetSegment(SegmentId id) override;
   void reportReadLimitReached() override;
+  kj::Maybe<kj::Own<ClientHook>> extractCap(uint index);
 
 private:
   MessageBuilder* message;
   ReadLimiter dummyLimiter;
+  kj::Vector<kj::Maybe<kj::Own<ClientHook>>> capTable;
 
   SegmentBuilder segment0;
   kj::ArrayPtr<const word> segment0ForOutput;
 
   struct MultiSegmentState {
-    std::vector<kj::Own<SegmentBuilder>> builders;
-    std::vector<kj::ArrayPtr<const word>> forOutput;
+    kj::Vector<kj::Own<SegmentBuilder>> builders;
+    kj::Vector<kj::ArrayPtr<const word>> forOutput;
   };
-  kj::MutexGuarded<kj::Maybe<kj::Own<MultiSegmentState>>> moreSegments;
+  kj::Maybe<kj::Own<MultiSegmentState>> moreSegments;
 };
 
 // =======================================================================================
 
 inline ReadLimiter::ReadLimiter()
-    // I didn't want to #include <limits> just for this one lousy constant.
-    : limit(0x7fffffffffffffffllu) {}
+    : limit(kj::maxValue) {}
 
 inline ReadLimiter::ReadLimiter(WordCount64 limit): limit(limit / WORDS) {}
 
@@ -272,26 +316,16 @@ inline void SegmentReader::unread(WordCount64 amount) { readLimiter->unread(amou
 
 inline SegmentBuilder::SegmentBuilder(
     BuilderArena* arena, SegmentId id, kj::ArrayPtr<word> ptr, ReadLimiter* readLimiter)
-    : SegmentReader(arena, id, ptr, readLimiter),
-      pos(ptr.begin()) {}
+    : SegmentReader(arena, id, ptr, readLimiter), pos(ptr.begin()) {}
 
 inline word* SegmentBuilder::allocate(WordCount amount) {
-  word* result = __atomic_fetch_add(&pos, amount * BYTES_PER_WORD / BYTES, __ATOMIC_RELAXED);
-
-  // Careful about pointer arithmetic here.  The segment might be at the end of the address space,
-  // or `amount` could be ridiculously huge.
-  if (ptr.end() - (result + amount) < 0) {
+  if (intervalLength(pos, ptr.end()) < amount) {
     // Not enough space in the segment for this allocation.
-    if (ptr.end() - result >= 0) {
-      // It was our increment that pushed the pointer past the end of the segment.  Therefore no
-      // other thread could have accidentally allocated space in this segment in the meantime.
-      // We need to back up the pointer so that it will be correct when the data is written out
-      // (and also so that another allocation can potentially use the remaining space).
-      __atomic_store_n(&pos, result, __ATOMIC_RELAXED);
-    }
     return nullptr;
   } else {
     // Success.
+    word* result = pos;
+    pos = pos + amount;
     return result;
   }
 }

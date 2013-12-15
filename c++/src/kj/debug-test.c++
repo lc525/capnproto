@@ -31,6 +31,8 @@
 #include <errno.h>
 #include <string.h>
 #include <exception>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 namespace kj {
 namespace _ {  // private
@@ -51,7 +53,7 @@ public:
     // the child to die.
 
     int pipeFds[2];
-    pipe(pipeFds);
+    KJ_SYSCALL(pipe(pipeFds));
     pid_t child = fork();
     if (child == 0) {
       // This is the child!
@@ -262,7 +264,10 @@ TEST(Debug, Catch) {
 
     KJ_IF_MAYBE(e, exception) {
       String what = str(*e);
-      std::string text(what.cStr(), strchr(what.cStr(), '\n') - what.cStr());
+      KJ_IF_MAYBE(eol, what.findFirst('\n')) {
+        what = kj::str(what.slice(0, *eol));
+      }
+      std::string text(what.cStr());
       EXPECT_EQ(fileLine(__FILE__, line) + ": bug in code: foo", text);
     } else {
       ADD_FAILURE() << "Expected exception.";
@@ -278,7 +283,10 @@ TEST(Debug, Catch) {
 
     KJ_IF_MAYBE(e, exception) {
       String what = str(*e);
-      std::string text(what.cStr(), strchr(what.cStr(), '\n') - what.cStr());
+      KJ_IF_MAYBE(eol, what.findFirst('\n')) {
+        what = kj::str(what.slice(0, *eol));
+      }
+      std::string text(what.cStr());
       EXPECT_EQ(fileLine(__FILE__, line) + ": bug in code: foo", text);
     } else {
       ADD_FAILURE() << "Expected exception.";
@@ -291,8 +299,13 @@ TEST(Debug, Catch) {
       line = __LINE__; KJ_FAIL_ASSERT("foo");
       ADD_FAILURE() << "Expected exception.";
     } catch (const std::exception& e) {
-      const char* what = e.what();
-      std::string text(what, strchr(what, '\n') - what);
+      kj::StringPtr what = e.what();
+      std::string text;
+      KJ_IF_MAYBE(eol, what.findFirst('\n')) {
+        text.assign(what.cStr(), *eol);
+      } else {
+        text.assign(what.cStr());
+      }
       EXPECT_EQ(fileLine(__FILE__, line) + ": bug in code: foo", text);
     }
   }

@@ -24,7 +24,9 @@
 #define CAPNP_PRIVATE
 #include "arena.h"
 #include "message.h"
+#include "capability.h"
 #include <kj/debug.h>
+#include <kj/refcount.h>
 #include <vector>
 #include <string.h>
 #include <stdio.h>
@@ -63,17 +65,15 @@ SegmentReader* ReaderArena::tryGetSegment(SegmentId id) {
     }
   }
 
-  // TODO(someday):  Lock a mutex so that reading is thread-safe.  Take a reader lock during the
-  //   first lookup, unlock it before calling getSegment(), then take a writer lock to update the
-  //   map.  Bleh, lazy initialization is sad.
+  auto lock = moreSegments.lockExclusive();
 
   SegmentMap* segments = nullptr;
-  KJ_IF_MAYBE(s, moreSegments) {
-    auto iter = s->find(id.value);
-    if (iter != s->end()) {
-      return iter->second.get();
+  KJ_IF_MAYBE(s, *lock) {
+    auto iter = s->get()->find(id.value);
+    if (iter != s->get()->end()) {
+      return iter->second;
     }
-    segments = s;
+    segments = *s;
   }
 
   kj::ArrayPtr<const word> newSegment = message->getSegment(id.value);
@@ -81,11 +81,11 @@ SegmentReader* ReaderArena::tryGetSegment(SegmentId id) {
     return nullptr;
   }
 
-  if (moreSegments == nullptr) {
+  if (*lock == nullptr) {
     // OK, the segment exists, so allocate the map.
     auto s = kj::heap<SegmentMap>();
     segments = s;
-    moreSegments = mv(s);
+    *lock = kj::mv(s);
   }
 
   auto segment = kj::heap<SegmentReader>(this, id, newSegment, &readLimiter);
@@ -100,6 +100,14 @@ void ReaderArena::reportReadLimitReached() {
   }
 }
 
+kj::Maybe<kj::Own<ClientHook>> ReaderArena::extractCap(uint index) {
+  if (index < capTable.size()) {
+    return capTable[index].map([](kj::Own<ClientHook>& cap) { return cap->addRef(); });
+  } else {
+    return nullptr;
+  }
+}
+
 // =======================================================================================
 
 BuilderArena::BuilderArena(MessageBuilder* message)
@@ -111,12 +119,9 @@ SegmentBuilder* BuilderArena::getSegment(SegmentId id) {
   if (id == SegmentId(0)) {
     return &segment0;
   } else {
-    auto lock = moreSegments.lockShared();
-    KJ_IF_MAYBE(s, *lock) {
-      KJ_REQUIRE(id.value - 1 < s->builders.size(), "invalid segment id", id.value);
-      // TODO(cleanup):  Return a const SegmentBuilder and tediously constify all SegmentBuilder
-      //   pointers throughout the codebase.
-      return const_cast<SegmentBuilder*>(s->builders[id.value - 1].get());
+    KJ_IF_MAYBE(s, moreSegments) {
+      KJ_REQUIRE(id.value - 1 < s->get()->builders.size(), "invalid segment id", id.value);
+      return const_cast<SegmentBuilder*>(s->get()->builders[id.value - 1].get());
     } else {
       KJ_FAIL_REQUIRE("invalid segment id", id.value);
     }
@@ -125,8 +130,7 @@ SegmentBuilder* BuilderArena::getSegment(SegmentId id) {
 
 BuilderArena::AllocateResult BuilderArena::allocate(WordCount amount) {
   if (segment0.getArena() == nullptr) {
-    // We're allocating the first segment.  We don't need to worry about threads at this point
-    // because calling MessageBuilder::initRoot() from multiple threads is not intended to be safe.
+    // We're allocating the first segment.
     kj::ArrayPtr<word> ptr = message->allocateSegment(amount / WORDS);
 
     // Re-allocate segment0 in-place.  This is a bit of a hack, but we have not returned any
@@ -135,7 +139,7 @@ BuilderArena::AllocateResult BuilderArena::allocate(WordCount amount) {
     kj::ctor(segment0, this, SegmentId(0), ptr, &this->dummyLimiter);
     return AllocateResult { &segment0, segment0.allocate(amount) };
   } else {
-    // Check if there is space in the first segment.  We can do this without locking.
+    // Check if there is space in the first segment.
     word* attempt = segment0.allocate(amount);
     if (attempt != nullptr) {
       return AllocateResult { &segment0, attempt };
@@ -143,9 +147,8 @@ BuilderArena::AllocateResult BuilderArena::allocate(WordCount amount) {
 
     // Need to fall back to additional segments.
 
-    auto lock = moreSegments.lockExclusive();
     MultiSegmentState* segmentState;
-    KJ_IF_MAYBE(s, *lock) {
+    KJ_IF_MAYBE(s, moreSegments) {
       // TODO(perf):  Check for available space in more than just the last segment.  We don't
       //   want this to be O(n), though, so we'll need to maintain some sort of table.  Complicating
       //   matters, we want SegmentBuilders::allocate() to be fast, so we can't update any such
@@ -153,49 +156,48 @@ BuilderArena::AllocateResult BuilderArena::allocate(WordCount amount) {
       //   on the last-known available size, and then re-check the size when we pop segments off it
       //   and shove them to the back of the queue if they have become too small.
 
-      attempt = s->builders.back()->allocate(amount);
+      attempt = s->get()->builders.back()->allocate(amount);
       if (attempt != nullptr) {
-        return AllocateResult { s->builders.back().get(), attempt };
+        return AllocateResult { s->get()->builders.back().get(), attempt };
       }
-      segmentState = s;
+      segmentState = *s;
     } else {
       auto newSegmentState = kj::heap<MultiSegmentState>();
       segmentState = newSegmentState;
-      *lock = kj::mv(newSegmentState);
+      moreSegments = kj::mv(newSegmentState);
     }
 
     kj::Own<SegmentBuilder> newBuilder = kj::heap<SegmentBuilder>(
         this, SegmentId(segmentState->builders.size() + 1),
         message->allocateSegment(amount / WORDS), &this->dummyLimiter);
     SegmentBuilder* result = newBuilder.get();
-    segmentState->builders.push_back(kj::mv(newBuilder));
+    segmentState->builders.add(kj::mv(newBuilder));
 
     // Keep forOutput the right size so that we don't have to re-allocate during
     // getSegmentsForOutput(), which callers might reasonably expect is a thread-safe method.
     segmentState->forOutput.resize(segmentState->builders.size() + 1);
 
-    // Allocating from the new segment is guaranteed to succeed since no other thread could have
-    // received a pointer to it yet (since we still hold the lock).
+    // Allocating from the new segment is guaranteed to succeed since we made it big enough.
     return AllocateResult { result, result->allocate(amount) };
   }
 }
 
 kj::ArrayPtr<const kj::ArrayPtr<const word>> BuilderArena::getSegmentsForOutput() {
-  // We shouldn't need to lock a mutex here because if this is called multiple times simultaneously,
-  // we should only be overwriting the array with the exact same data.  If the number or size of
-  // segments is actually changing due to an activity in another thread, then the caller has a
-  // problem regardless of locking here.
+  // Although this is a read-only method, we shouldn't need to lock a mutex here because if this
+  // is called multiple times simultaneously, we should only be overwriting the array with the
+  // exact same data.  If the number or size of segments is actually changing due to an activity
+  // in another thread, then the caller has a problem regardless of locking here.
 
-  KJ_IF_MAYBE(segmentState, moreSegments.getWithoutLock()) {
-    KJ_DASSERT(segmentState->forOutput.size() == segmentState->builders.size() + 1,
+  KJ_IF_MAYBE(segmentState, moreSegments) {
+    KJ_DASSERT(segmentState->get()->forOutput.size() == segmentState->get()->builders.size() + 1,
         "segmentState->forOutput wasn't resized correctly when the last builder was added.",
-        segmentState->forOutput.size(), segmentState->builders.size());
+        segmentState->get()->forOutput.size(), segmentState->get()->builders.size());
 
     kj::ArrayPtr<kj::ArrayPtr<const word>> result(
-        &segmentState->forOutput[0], segmentState->forOutput.size());
+        &segmentState->get()->forOutput[0], segmentState->get()->forOutput.size());
     uint i = 0;
     result[i++] = segment0.currentlyAllocated();
-    for (auto& builder: segmentState->builders) {
+    for (auto& builder: segmentState->get()->builders) {
       result[i++] = builder->currentlyAllocated();
     }
     return result;
@@ -220,13 +222,12 @@ SegmentReader* BuilderArena::tryGetSegment(SegmentId id) {
       return &segment0;
     }
   } else {
-    auto lock = moreSegments.lockShared();
-    KJ_IF_MAYBE(segmentState, *lock) {
-      if (id.value <= segmentState->builders.size()) {
+    KJ_IF_MAYBE(segmentState, moreSegments) {
+      if (id.value <= segmentState->get()->builders.size()) {
         // TODO(cleanup):  Return a const SegmentReader and tediously constify all SegmentBuilder
         //   pointers throughout the codebase.
         return const_cast<SegmentReader*>(kj::implicitCast<const SegmentReader*>(
-            segmentState->builders[id.value - 1].get()));
+            segmentState->get()->builders[id.value - 1].get()));
       }
     }
     return nullptr;
@@ -234,10 +235,32 @@ SegmentReader* BuilderArena::tryGetSegment(SegmentId id) {
 }
 
 void BuilderArena::reportReadLimitReached() {
-  KJ_FAIL_ASSERT(
-      "Read limit reached for BuilderArena, but it should have been unlimited.") {
+  KJ_FAIL_ASSERT("Read limit reached for BuilderArena, but it should have been unlimited.") {
     return;
   }
+}
+
+kj::Maybe<kj::Own<ClientHook>> BuilderArena::extractCap(uint index) {
+  if (index < capTable.size()) {
+    return capTable[index].map([](kj::Own<ClientHook>& cap) { return cap->addRef(); });
+  } else {
+    return nullptr;
+  }
+}
+
+uint BuilderArena::injectCap(kj::Own<ClientHook>&& cap) {
+  // TODO(perf):  Detect if the cap is already on the table and reuse the index?  Perhaps this
+  //   doesn't happen enough to be worth the effort.
+  uint result = capTable.size();
+  capTable.add(kj::mv(cap));
+  return result;
+}
+
+void BuilderArena::dropCap(uint index) {
+  KJ_ASSERT(index < capTable.size(), "Invalid capability descriptor in message.") {
+    return;
+  }
+  capTable[index] = nullptr;
 }
 
 }  // namespace _ (private)

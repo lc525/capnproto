@@ -123,12 +123,37 @@ void Mutex::unlock(Exclusivity exclusivity) {
   }
 }
 
+void Mutex::assertLockedByCaller(Exclusivity exclusivity) {
+  switch (exclusivity) {
+    case EXCLUSIVE:
+      KJ_ASSERT(futex & EXCLUSIVE_HELD,
+                "Tried to call getAlreadyLocked*() but lock is not held.");
+      break;
+    case SHARED:
+      KJ_ASSERT(futex & SHARED_COUNT_MASK,
+                "Tried to call getAlreadyLocked*() but lock is not held.");
+      break;
+  }
+}
+
 void Once::runOnce(Initializer& init) {
+startOver:
   uint state = UNINITIALIZED;
   if (__atomic_compare_exchange_n(&futex, &state, INITIALIZING, false,
                                   __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
     // It's our job to initialize!
-    init.run();
+    {
+      KJ_ON_SCOPE_FAILURE({
+        // An exception was thrown by the initializer.  We have to revert.
+        if (__atomic_exchange_n(&futex, UNINITIALIZED, __ATOMIC_RELEASE) ==
+            INITIALIZING_WITH_WAITERS) {
+          // Someone was waiting for us to finish.
+          syscall(SYS_futex, &futex, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+        }
+      });
+
+      init.run();
+    }
     if (__atomic_exchange_n(&futex, INITIALIZED, __ATOMIC_RELEASE) ==
         INITIALIZING_WITH_WAITERS) {
       // Someone was waiting for us to finish.
@@ -136,28 +161,74 @@ void Once::runOnce(Initializer& init) {
     }
   } else {
     for (;;) {
-      if (state == INITIALIZED) {
+      if (state == INITIALIZED || state == DISABLED) {
         break;
       } else if (state == INITIALIZING) {
         // Initialization is taking place in another thread.  Indicate that we're waiting.
         if (!__atomic_compare_exchange_n(&futex, &state, INITIALIZING_WITH_WAITERS, true,
-                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                                         __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
           // State changed, retry.
           continue;
         }
+      } else {
+        KJ_DASSERT(state == INITIALIZING_WITH_WAITERS);
       }
 
       // Wait for initialization.
       syscall(SYS_futex, &futex, FUTEX_WAIT_PRIVATE, INITIALIZING_WITH_WAITERS, NULL, NULL, 0);
       state = __atomic_load_n(&futex, __ATOMIC_ACQUIRE);
-    }
 
-    // The docs for __atomic_compare_exchange_n claim that the memmodel for the failure case cannot
-    // be stronger than the success case.  That's disappointing, because what we really want is
-    // for the two cmpxchg calls above to do an acquire barrier in the failure case only, while
-    // being relaxed if successful, so that once the state is INITIALIZED we know we've acquired
-    // it.  Oh well, we'll just do an acquire barrier on the way out instead.
-    KJ_ASSERT(__atomic_load_n(&futex, __ATOMIC_ACQUIRE) == INITIALIZED);
+      if (state == UNINITIALIZED) {
+        // Oh hey, apparently whoever was trying to initialize gave up.  Let's take it from the
+        // top.
+        goto startOver;
+      }
+    }
+  }
+}
+
+void Once::reset() {
+  uint state = INITIALIZED;
+  if (!__atomic_compare_exchange_n(&futex, &state, UNINITIALIZED,
+                                   false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+    KJ_REQUIRE(state == DISABLED, "reset() called while not initialized.");
+  }
+}
+
+void Once::disable() noexcept {
+  uint state = __atomic_load_n(&futex, __ATOMIC_ACQUIRE);
+  for (;;) {
+    switch (state) {
+      case DISABLED:
+      default:
+        return;
+
+      case UNINITIALIZED:
+      case INITIALIZED:
+        // Try to transition the state to DISABLED.
+        if (!__atomic_compare_exchange_n(&futex, &state, DISABLED, true,
+                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+          // State changed, retry.
+          continue;
+        }
+        // Success.
+        return;
+
+      case INITIALIZING:
+        // Initialization is taking place in another thread.  Indicate that we're waiting.
+        if (!__atomic_compare_exchange_n(&futex, &state, INITIALIZING_WITH_WAITERS, true,
+                                         __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+          // State changed, retry.
+          continue;
+        }
+        // no break
+
+      case INITIALIZING_WITH_WAITERS:
+        // Wait for initialization.
+        syscall(SYS_futex, &futex, FUTEX_WAIT_PRIVATE, INITIALIZING_WITH_WAITERS, NULL, NULL, 0);
+        state = __atomic_load_n(&futex, __ATOMIC_ACQUIRE);
+        continue;
+    }
   }
 }
 
@@ -203,7 +274,27 @@ void Mutex::unlock(Exclusivity exclusivity) {
   KJ_PTHREAD_CALL(pthread_rwlock_unlock(&mutex));
 }
 
-Once::Once(): initialized(false) {
+void Mutex::assertLockedByCaller(Exclusivity exclusivity) {
+  switch (exclusivity) {
+    case EXCLUSIVE:
+      // A read lock should fail if the mutex is already held for writing.
+      if (pthread_rwlock_tryrdlock(&mutex) == 0) {
+        pthread_rwlock_unlock(&mutex);
+        KJ_FAIL_ASSERT("Tried to call getAlreadyLocked*() but lock is not held.");
+      }
+      break;
+    case SHARED:
+      // A write lock should fail if the mutex is already held for reading or writing.  We don't
+      // have any way to prove that the lock is held only for reading.
+      if (pthread_rwlock_trywrlock(&mutex) == 0) {
+        pthread_rwlock_unlock(&mutex);
+        KJ_FAIL_ASSERT("Tried to call getAlreadyLocked*() but lock is not held.");
+      }
+      break;
+  }
+}
+
+Once::Once(bool startInitialized): state(startInitialized ? INITIALIZED : UNINITIALIZED) {
   KJ_PTHREAD_CALL(pthread_mutex_init(&mutex, nullptr));
 }
 Once::~Once() {
@@ -214,13 +305,28 @@ void Once::runOnce(Initializer& init) {
   KJ_PTHREAD_CALL(pthread_mutex_lock(&mutex));
   KJ_DEFER(KJ_PTHREAD_CALL(pthread_mutex_unlock(&mutex)));
 
-  if (initialized) {
+  if (state != UNINITIALIZED) {
     return;
   }
 
   init.run();
 
-  __atomic_store_n(&initialized, true, __ATOMIC_RELEASE);
+  __atomic_store_n(&state, INITIALIZED, __ATOMIC_RELEASE);
+}
+
+void Once::reset() {
+  State oldState = INITIALIZED;
+  if (!__atomic_compare_exchange_n(&state, &oldState, UNINITIALIZED,
+                                   false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+    KJ_REQUIRE(oldState == DISABLED, "reset() called while not initialized.");
+  }
+}
+
+void Once::disable() noexcept {
+  KJ_PTHREAD_CALL(pthread_mutex_lock(&mutex));
+  KJ_DEFER(KJ_PTHREAD_CALL(pthread_mutex_unlock(&mutex)));
+
+  __atomic_store_n(&state, DISABLED, __ATOMIC_RELAXED);
 }
 
 #endif

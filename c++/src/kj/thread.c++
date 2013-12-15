@@ -24,22 +24,57 @@
 #include "thread.h"
 #include "debug.h"
 #include <pthread.h>
+#include <signal.h>
 
 namespace kj {
 
-Thread::Thread(void* (*run)(void*), void (*deleteArg)(void*), void* arg) {
+Thread::Thread(Function<void()> func): func(kj::mv(func)) {
   static_assert(sizeof(threadId) >= sizeof(pthread_t),
                 "pthread_t is larger than a long long on your platform.  Please port.");
 
-  int pthreadResult = pthread_create(reinterpret_cast<pthread_t*>(&threadId), nullptr, run, arg);
+  int pthreadResult = pthread_create(reinterpret_cast<pthread_t*>(&threadId),
+                                     nullptr, &runThread, this);
   if (pthreadResult != 0) {
-    deleteArg(arg);
     KJ_FAIL_SYSCALL("pthread_create", pthreadResult);
   }
 }
 
-Thread::~Thread() {
-  KJ_ASSERT(pthread_join(*reinterpret_cast<pthread_t*>(&threadId), nullptr) == 0);
+Thread::~Thread() noexcept(false) {
+  if (!detached) {
+    int pthreadResult = pthread_join(*reinterpret_cast<pthread_t*>(&threadId), nullptr);
+    if (pthreadResult != 0) {
+      KJ_FAIL_SYSCALL("pthread_join", pthreadResult) { break; }
+    }
+
+    KJ_IF_MAYBE(e, exception) {
+      kj::throwRecoverableException(kj::mv(*e));
+    }
+  }
+}
+
+void Thread::sendSignal(int signo) {
+  int pthreadResult = pthread_kill(*reinterpret_cast<pthread_t*>(&threadId), signo);
+  if (pthreadResult != 0) {
+    KJ_FAIL_SYSCALL("pthread_kill", pthreadResult) { break; }
+  }
+}
+
+void Thread::detach() {
+  int pthreadResult = pthread_detach(*reinterpret_cast<pthread_t*>(&threadId));
+  if (pthreadResult != 0) {
+    KJ_FAIL_SYSCALL("pthread_detach", pthreadResult) { break; }
+  }
+  detached = true;
+}
+
+void* Thread::runThread(void* ptr) {
+  Thread* thread = reinterpret_cast<Thread*>(ptr);
+  KJ_IF_MAYBE(exception, kj::runCatchingExceptions([&]() {
+    thread->func();
+  })) {
+    thread->exception = kj::mv(*exception);
+  }
+  return nullptr;
 }
 
 }  // namespace kj

@@ -26,7 +26,7 @@
 
 #include "memory.h"
 
-#if __linux__ && !defined(KJ_FUTEX)
+#if __linux__ && !defined(KJ_USE_FUTEX)
 #define KJ_USE_FUTEX 1
 #endif
 
@@ -59,6 +59,11 @@ public:
   void lock(Exclusivity exclusivity);
   void unlock(Exclusivity exclusivity);
 
+  void assertLockedByCaller(Exclusivity exclusivity);
+  // In debug mode, assert that the mutex is locked by the calling thread, or if that is
+  // non-trivial, assert that the mutex is locked (which should be good enough to catch problems
+  // in unit tests).  In non-debug builds, do nothing.
+
 private:
 #if KJ_USE_FUTEX
   uint futex;
@@ -82,9 +87,10 @@ class Once {
 
 public:
 #if KJ_USE_FUTEX
-  inline Once(): futex(UNINITIALIZED) {}
+  inline Once(bool startInitialized = false)
+      : futex(startInitialized ? INITIALIZED : UNINITIALIZED) {}
 #else
-  Once();
+  Once(bool startInitialized = false);
   ~Once();
 #endif
   KJ_DISALLOW_COPY(Once);
@@ -101,7 +107,26 @@ public:
 #if KJ_USE_FUTEX
     return __atomic_load_n(&futex, __ATOMIC_ACQUIRE) == INITIALIZED;
 #else
-    return __atomic_load_n(&initialized, __ATOMIC_ACQUIRE);
+    return __atomic_load_n(&state, __ATOMIC_ACQUIRE) == INITIALIZED;
+#endif
+  }
+
+  void reset();
+  // Returns the state from initialized to uninitialized.  It is an error to call this when
+  // not already initialized, or when runOnce() or isInitialized() might be called concurrently in
+  // another thread.
+
+  void disable() noexcept;
+  // Prevent future calls to runOnce() and reset() from having any effect, and make isInitialized()
+  // return false forever.  If an initializer is currently running, block until it completes.
+
+  bool isDisabled() noexcept {
+    // Returns true if `disable()` has been called.
+
+#if KJ_USE_FUTEX
+    return __atomic_load_n(&futex, __ATOMIC_ACQUIRE) == DISABLED;
+#else
+    return __atomic_load_n(&state, __ATOMIC_ACQUIRE) == DISABLED;
 #endif
   }
 
@@ -109,13 +134,21 @@ private:
 #if KJ_USE_FUTEX
   uint futex;
 
-  static constexpr uint UNINITIALIZED = 0;
-  static constexpr uint INITIALIZING = 1;
-  static constexpr uint INITIALIZING_WITH_WAITERS = 2;
-  static constexpr uint INITIALIZED = 3;
+  enum State {
+    UNINITIALIZED,
+    INITIALIZING,
+    INITIALIZING_WITH_WAITERS,
+    INITIALIZED,
+    DISABLED
+  };
 
 #else
-  bool initialized;
+  enum State {
+    UNINITIALIZED,
+    INITIALIZED,
+    DISABLED
+  };
+  State state;
   pthread_mutex_t mutex;
 #endif
 };
@@ -142,12 +175,18 @@ public:
   }
 
   inline Locked& operator=(Locked&& other) {
-    if (mutex != nullptr) mutex->unlock(isConst<T>());
+    if (mutex != nullptr) mutex->unlock(isConst<T>() ? _::Mutex::SHARED : _::Mutex::EXCLUSIVE);
     mutex = other.mutex;
     ptr = other.ptr;
     other.mutex = nullptr;
     other.ptr = nullptr;
     return *this;
+  }
+
+  inline void release() {
+    if (mutex != nullptr) mutex->unlock(isConst<T>() ? _::Mutex::SHARED : _::Mutex::EXCLUSIVE);
+    mutex = nullptr;
+    ptr = nullptr;
   }
 
   inline T* operator->() { return ptr; }
@@ -207,6 +246,11 @@ public:
   // Escape hatch for cases where some external factor guarantees that it's safe to get the
   // value.  You should treat these like const_cast -- be highly suspicious of any use.
 
+  inline const T& getAlreadyLockedShared() const;
+  inline T& getAlreadyLockedShared();
+  inline T& getAlreadyLockedExclusive() const;
+  // Like `getWithoutLock()`, but asserts that the lock is already held by the calling thread.
+
 private:
   mutable _::Mutex mutex;
   mutable T value;
@@ -263,6 +307,28 @@ template <typename T>
 inline Locked<const T> MutexGuarded<T>::lockShared() const {
   mutex.lock(_::Mutex::SHARED);
   return Locked<const T>(mutex, value);
+}
+
+template <typename T>
+inline const T& MutexGuarded<T>::getAlreadyLockedShared() const {
+#ifdef KJ_DEBUG
+  mutex.assertLockedByCaller(_::Mutex::SHARED);
+#endif
+  return value;
+}
+template <typename T>
+inline T& MutexGuarded<T>::getAlreadyLockedShared() {
+#ifdef KJ_DEBUG
+  mutex.assertLockedByCaller(_::Mutex::SHARED);
+#endif
+  return value;
+}
+template <typename T>
+inline T& MutexGuarded<T>::getAlreadyLockedExclusive() const {
+#ifdef KJ_DEBUG
+  mutex.assertLockedByCaller(_::Mutex::EXCLUSIVE);
+#endif
+  return const_cast<T&>(value);
 }
 
 template <typename T>

@@ -27,7 +27,6 @@
 #include <capnp/orphan.h>
 #include <capnp/compiler/grammar.capnp.h>
 #include <capnp/schema.capnp.h>
-#include <capnp/schema-loader.h>
 #include <capnp/dynamic.h>
 #include <kj/vector.h>
 #include "error-reporter.h"
@@ -47,31 +46,54 @@ public:
   public:
     struct ResolvedName {
       uint64_t id;
-      Declaration::Body::Which kind;
+      Declaration::Which kind;
     };
 
-    virtual kj::Maybe<ResolvedName> resolve(const DeclName::Reader& name) const = 0;
+    virtual kj::Maybe<ResolvedName> resolve(const DeclName::Reader& name) = 0;
     // Look up the given name, relative to this node, and return basic information about the
     // target.
 
-    virtual Schema resolveMaybeBootstrapSchema(uint64_t id) const = 0;
-    // Get the schema for the given ID.  Returning either a bootstrap schema or a final schema
-    // is acceptable.  Throws an exception if the id is not one that was found by calling resolve()
-    // or by traversing other schemas.
+    virtual kj::Maybe<Schema> resolveBootstrapSchema(uint64_t id) = 0;
+    // Get the schema for the given ID.  If a schema is returned, it must be safe to traverse its
+    // dependencies using Schema::getDependency().  A schema that is only at the bootstrap stage
+    // is acceptable.
+    //
+    // Throws an exception if the id is not one that was found by calling resolve() or by
+    // traversing other schemas.  Returns null if the ID is recognized, but the corresponding
+    // schema node failed to be built for reasons that were already reported.
 
-    virtual Schema resolveFinalSchema(uint64_t id) const = 0;
-    // Get the final schema for the given ID.  A bootstrap schema is not acceptable.  Throws an
-    // exception if the id is not one that was found by calling resolve() or by traversing other
-    // schemas.
+    virtual kj::Maybe<schema::Node::Reader> resolveFinalSchema(uint64_t id) = 0;
+    // Get the final schema for the given ID.  A bootstrap schema is not acceptable.  A raw
+    // node reader is returned rather than a Schema object because using a Schema object built
+    // by the final schema loader could trigger lazy initialization of dependencies which could
+    // lead to a cycle and deadlock.
+    //
+    // Throws an exception if the id is not one that was found by calling resolve() or by
+    // traversing other schemas.  Returns null if the ID is recognized, but the corresponding
+    // schema node failed to be built for reasons that were already reported.
+
+    virtual kj::Maybe<uint64_t> resolveImport(kj::StringPtr name) = 0;
+    // Get the ID of an imported file given the import path.
   };
 
-  NodeTranslator(const Resolver& resolver, const ErrorReporter& errorReporter,
-                 const Declaration::Reader& decl, Orphan<schema::Node> wipNode);
+  NodeTranslator(Resolver& resolver, ErrorReporter& errorReporter,
+                 const Declaration::Reader& decl, Orphan<schema::Node> wipNode,
+                 bool compileAnnotations);
   // Construct a NodeTranslator to translate the given declaration.  The wipNode starts out with
   // `displayName`, `id`, `scopeId`, and `nestedNodes` already initialized.  The `NodeTranslator`
   // fills in the rest.
 
-  schema::Node::Reader getBootstrapNode() { return wipNode.getReader(); }
+  struct NodeSet {
+    schema::Node::Reader node;
+    // The main node.
+
+    kj::Array<schema::Node::Reader> auxNodes;
+    // Auxiliary nodes that were produced when translating this node and should be loaded along
+    // with it.  In particular, structs that contain groups (or named unions) spawn extra nodes
+    // representing those, and interfaces spawn struct nodes representing method params/results.
+  };
+
+  NodeSet getBootstrapNode();
   // Get an incomplete version of the node in which pointer-typed value expressions have not yet
   // been translated.  Instead, for all `schema.Value` objects representing pointer-type values,
   // the value is set to an appropriate "empty" value.  This version of the schema can be used to
@@ -80,16 +102,25 @@ public:
   // If the final node has already been built, this will actually return the final node (in fact,
   // it's the same node object).
 
-  schema::Node::Reader finish();
+  NodeSet finish();
   // Finish translating the node (including filling in all the pieces that are missing from the
   // bootstrap node) and return it.
 
 private:
-  const Resolver& resolver;
-  const ErrorReporter& errorReporter;
+  Resolver& resolver;
+  ErrorReporter& errorReporter;
+  Orphanage orphanage;
+  bool compileAnnotations;
 
   Orphan<schema::Node> wipNode;
   // The work-in-progress schema node.
+
+  kj::Vector<Orphan<schema::Node>> groups;
+  // If this is a struct node and it contains groups, these are the nodes for those groups,  which
+  // must be loaded together with the top-level node.
+
+  kj::Vector<Orphan<schema::Node>> paramStructs;
+  // If this is an interface, these are the auto-generated structs representing params and results.
 
   struct UnfinishedValue {
     ValueExpression::Reader source;
@@ -104,30 +135,28 @@ private:
 
   void compileNode(Declaration::Reader decl, schema::Node::Builder builder);
 
-  void checkMembers(List<Declaration>::Reader nestedDecls, Declaration::Body::Which parentKind);
-  // Check the given member list for errors, including detecting duplicate names and detecting
-  // out-of-place declarations.
-
-  void disallowNested(List<Declaration>::Reader nestedDecls);
-  // Complain if the nested decl list is non-empty.
-
-  void compileFile(Declaration::Reader decl, schema::FileNode::Builder builder);
-  void compileConst(Declaration::Const::Reader decl, schema::ConstNode::Builder builder);
+  void compileConst(Declaration::Const::Reader decl, schema::Node::Const::Builder builder);
   void compileAnnotation(Declaration::Annotation::Reader decl,
-                         schema::AnnotationNode::Builder builder);
+                         schema::Node::Annotation::Builder builder);
 
+  class DuplicateNameDetector;
   class DuplicateOrdinalDetector;
   class StructLayout;
   class StructTranslator;
 
-  void compileEnum(Declaration::Enum::Reader decl, List<Declaration>::Reader members,
-                   schema::EnumNode::Builder builder);
-  void compileStruct(Declaration::Struct::Reader decl, List<Declaration>::Reader members,
-                     schema::StructNode::Builder builder);
-  void compileInterface(Declaration::Interface::Reader decl, List<Declaration>::Reader members,
-                        schema::InterfaceNode::Builder builder);
+  void compileEnum(Void decl, List<Declaration>::Reader members,
+                   schema::Node::Builder builder);
+  void compileStruct(Void decl, List<Declaration>::Reader members,
+                     schema::Node::Builder builder);
+  void compileInterface(Declaration::Interface::Reader decl,
+                        List<Declaration>::Reader members,
+                        schema::Node::Builder builder);
   // The `members` arrays contain only members with ordinal numbers, in code order.  Other members
   // are handled elsewhere.
+
+  uint64_t compileParamList(kj::StringPtr methodName, uint16_t ordinal, bool isResults,
+                            Declaration::ParamList::Reader paramList);
+  // Compile a param (or result) list and return the type ID of the struct type.
 
   bool compileType(TypeExpression::Reader source, schema::Type::Builder target);
   // Returns false if there was a problem, in which case value expressions of this type should
@@ -145,31 +174,49 @@ private:
                     schema::Value::Builder target, bool isBootstrap);
   // Interprets the value expression and initializes `target` with the result.
 
-  class DynamicSlot;
+  kj::Maybe<DynamicValue::Reader> readConstant(DeclName::Reader name, bool isBootstrap);
+  // Get the value of the given constant.  May return null if some error occurs, which will already
+  // have been reported.
 
-  void compileValue(ValueExpression::Reader src, DynamicSlot& dst, bool isBootstrap);
-  // Fill in `dst` (which effectively points to a struct field or list element) with the given
-  // value.
-
-  void compileValueInner(ValueExpression::Reader src, DynamicSlot& dst, bool isBootstrap);
-  // Helper for compileValue().
-
-  void copyValue(schema::Value::Reader src, schema::Type::Reader srcType,
-                 schema::Value::Builder dst, schema::Type::Reader dstType,
-                 ValueExpression::Reader errorLocation);
-  // Copy a value from one schema to another, possibly coercing the type if compatible, or
-  // reporting an error otherwise.
-
-  kj::Maybe<DynamicValue::Reader> readConstant(DeclName::Reader name, bool isBootstrap,
-                                               ValueExpression::Reader errorLocation);
-  // Get the value of the given constant.
-
-  ListSchema makeListSchemaOf(schema::Type::Reader elementType);
-  // Construct a list schema representing a list of elements of the given type.
+  kj::Maybe<ListSchema> makeListSchemaOf(schema::Type::Reader elementType);
+  // Construct a list schema representing a list of elements of the given type.  May return null if
+  // some error occurs, which will already have been reported.
 
   Orphan<List<schema::Annotation>> compileAnnotationApplications(
       List<Declaration::AnnotationApplication>::Reader annotations,
       kj::StringPtr targetsFlagName);
+};
+
+class ValueTranslator {
+public:
+  class Resolver {
+  public:
+    virtual kj::Maybe<Schema> resolveType(uint64_t id) = 0;
+    virtual kj::Maybe<DynamicValue::Reader> resolveConstant(DeclName::Reader name) = 0;
+  };
+
+  ValueTranslator(Resolver& resolver, ErrorReporter& errorReporter, Orphanage orphanage)
+      : resolver(resolver), errorReporter(errorReporter), orphanage(orphanage) {}
+
+  kj::Maybe<Orphan<DynamicValue>> compileValue(
+      ValueExpression::Reader src, schema::Type::Reader type);
+
+private:
+  Resolver& resolver;
+  ErrorReporter& errorReporter;
+  Orphanage orphanage;
+
+  Orphan<DynamicValue> compileValueInner(ValueExpression::Reader src, schema::Type::Reader type);
+  // Helper for compileValue().
+
+  void fillStructValue(DynamicStruct::Builder builder,
+                       List<ValueExpression::FieldAssignment>::Reader assignments);
+  // Interprets the given assignments and uses them to fill in the given struct builder.
+
+  kj::String makeNodeName(uint64_t id);
+  kj::String makeTypeName(schema::Type::Reader type);
+
+  kj::Maybe<ListSchema> makeListSchemaOf(schema::Type::Reader elementType);
 };
 
 }  // namespace compiler

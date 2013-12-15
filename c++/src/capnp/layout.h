@@ -32,24 +32,29 @@
 #define CAPNP_LAYOUT_H_
 
 #include <kj/common.h>
+#include <kj/memory.h>
 #include "common.h"
 #include "blob.h"
 #include "endian.h"
 
 namespace capnp {
+
+class ClientHook;
+
 namespace _ {  // private
 
+class PointerBuilder;
+class PointerReader;
 class StructBuilder;
 class StructReader;
 class ListBuilder;
 class ListReader;
 class OrphanBuilder;
-struct ObjectBuilder;
-struct ObjectReader;
 struct WirePointer;
 struct WireHelpers;
 class SegmentReader;
 class SegmentBuilder;
+class Arena;
 class BuilderArena;
 
 // =============================================================================
@@ -154,11 +159,27 @@ template <> struct ElementSizeForType<Data> {
   static constexpr FieldSize value = FieldSize::POINTER;
 };
 
-}  // namespace _ (private)
+template <typename T>
+inline constexpr FieldSize elementSizeForType() {
+  return ElementSizeForType<T>::value;
+}
+
+struct MessageSizeCounts {
+  WordCount64 wordCount;
+  uint capCount;
+
+  MessageSizeCounts& operator+=(const MessageSizeCounts& other) {
+    wordCount += other.wordCount;
+    capCount += other.capCount;
+    return *this;
+  }
+
+  MessageSize asPublic() {
+    return MessageSize { wordCount / WORDS, capCount };
+  }
+};
 
 // =============================================================================
-
-namespace _ {  // private
 
 template <int wordCount>
 union AlignedData {
@@ -263,19 +284,143 @@ inline double unmask<double>(uint64_t value, uint64_t mask) {
 
 // -------------------------------------------------------------------
 
+class PointerBuilder: public kj::DisallowConstCopy {
+  // Represents a single pointer, usually embedded in a struct or a list.
+
+public:
+  inline PointerBuilder(): segment(nullptr), pointer(nullptr) {}
+
+  static inline PointerBuilder getRoot(SegmentBuilder* segment, word* location);
+  // Get a PointerBuilder representing a message root located in the given segment at the given
+  // location.
+
+  bool isNull();
+
+  StructBuilder getStruct(StructSize size, const word* defaultValue);
+  ListBuilder getList(FieldSize elementSize, const word* defaultValzue);
+  ListBuilder getStructList(StructSize elementSize, const word* defaultValue);
+  template <typename T> typename T::Builder getBlob(const void* defaultValue,ByteCount defaultSize);
+  kj::Own<ClientHook> getCapability();
+  // Get methods:  Get the value.  If it is null, initialize it to a copy of the default value.
+  // The default value is encoded as an "unchecked message" for structs, lists, and objects, or a
+  // simple byte array for blobs.
+
+  StructBuilder initStruct(StructSize size);
+  ListBuilder initList(FieldSize elementSize, ElementCount elementCount);
+  ListBuilder initStructList(ElementCount elementCount, StructSize size);
+  template <typename T> typename T::Builder initBlob(ByteCount size);
+  // Init methods:  Initialize the pointer to a newly-allocated object, discarding the existing
+  // object.
+
+  void setStruct(const StructReader& value);
+  void setList(const ListReader& value);
+  template <typename T> void setBlob(typename T::Reader value);
+  void setCapability(kj::Own<ClientHook>&& cap);
+  // Set methods:  Initialize the pointer to a newly-allocated copy of the given value, discarding
+  // the existing object.
+
+  void adopt(OrphanBuilder&& orphan);
+  // Set the pointer to point at the given orphaned value.
+
+  OrphanBuilder disown();
+  // Set the pointer to null and return its previous value as an orphan.
+
+  void clear();
+  // Clear the pointer to null, discarding its previous value.
+
+  void transferFrom(PointerBuilder other);
+  // Equivalent to `adopt(other.disown())`.
+
+  void copyFrom(PointerReader other);
+  // Equivalent to `set(other.get())`.
+
+  PointerReader asReader() const;
+
+  BuilderArena* getArena() const;
+  // Get the arena containing this pointer.
+
+private:
+  SegmentBuilder* segment;     // Memory segment in which the pointer resides.
+  WirePointer* pointer;        // Pointer to the pointer.
+
+  inline PointerBuilder(SegmentBuilder* segment, WirePointer* pointer)
+      : segment(segment), pointer(pointer) {}
+
+  friend class StructBuilder;
+  friend class ListBuilder;
+};
+
+class PointerReader {
+public:
+  inline PointerReader(): segment(nullptr), pointer(nullptr), nestingLimit(0x7fffffff) {}
+
+  static PointerReader getRoot(SegmentReader* segment, const word* location, int nestingLimit);
+  // Get a PointerReader representing a message root located in the given segment at the given
+  // location.
+
+  static inline PointerReader getRootUnchecked(const word* location);
+  // Get a PointerReader for an unchecked message.
+
+  MessageSizeCounts targetSize() const;
+  // Return the total size of the target object and everything to which it points.  Does not count
+  // far pointer overhead.  This is useful for deciding how much space is needed to copy the object
+  // into a flat array.  However, the caller is advised NOT to treat this value as secure.  Instead,
+  // use the result as a hint for allocating the first segment, do the copy, and then throw an
+  // exception if it overruns.
+
+  bool isNull() const;
+
+  StructReader getStruct(const word* defaultValue) const;
+  ListReader getList(FieldSize expectedElementSize, const word* defaultValue) const;
+  template <typename T>
+  typename T::Reader getBlob(const void* defaultValue, ByteCount defaultSize) const;
+  kj::Own<ClientHook> getCapability() const;
+  // Get methods:  Get the value.  If it is null, return the default value instead.
+  // The default value is encoded as an "unchecked message" for structs, lists, and objects, or a
+  // simple byte array for blobs.
+
+  const word* getUnchecked() const;
+  // If this is an unchecked message, get a word* pointing at the location of the pointer.  This
+  // word* can actually be passed to readUnchecked() to read the designated sub-object later.  If
+  // this isn't an unchecked message, throws an exception.
+
+  kj::Maybe<Arena&> getArena() const;
+  // Get the arena containing this pointer.
+
+private:
+  SegmentReader* segment;      // Memory segment in which the pointer resides.
+  const WirePointer* pointer;  // Pointer to the pointer.  null = treat as null pointer.
+
+  int nestingLimit;
+  // Limits the depth of message structures to guard against stack-overflow-based DoS attacks.
+  // Once this reaches zero, further pointers will be pruned.
+
+  inline PointerReader(SegmentReader* segment, const WirePointer* pointer, int nestingLimit)
+      : segment(segment), pointer(pointer), nestingLimit(nestingLimit) {}
+
+  friend class StructReader;
+  friend class ListReader;
+  friend class PointerBuilder;
+  friend class OrphanBuilder;
+};
+
 // -------------------------------------------------------------------
 
 class StructBuilder: public kj::DisallowConstCopy {
 public:
   inline StructBuilder(): segment(nullptr), data(nullptr), pointers(nullptr), bit0Offset(0) {}
 
-  static StructBuilder initRoot(SegmentBuilder* segment, word* location, StructSize size);
-  static void setRoot(SegmentBuilder* segment, word* location, StructReader value);
-  static StructBuilder getRoot(SegmentBuilder* segment, word* location, StructSize size);
+  inline word* getLocation() { return reinterpret_cast<word*>(data); }
+  // Get the object's location.  Only valid for independently-allocated objects (i.e. not list
+  // elements).
 
   inline BitCount getDataSectionSize() const { return dataSize; }
   inline WirePointerCount getPointerSectionSize() const { return pointerCount; }
   inline Data::Builder getDataSectionAsBlob();
+
+  template <typename T>
+  KJ_ALWAYS_INLINE(bool hasDataField(ElementCount offset));
+  // Return true if the field is set to something other than its default value.
 
   template <typename T>
   KJ_ALWAYS_INLINE(T getDataField(ElementCount offset));
@@ -298,78 +443,21 @@ public:
   // Like setDataField() but applies the given XOR mask before storing.  Used for writing fields
   // with non-zero default values.
 
-  StructBuilder initStructField(WirePointerCount ptrIndex, StructSize size);
-  // Initializes the struct field at the given index in the pointer section.  If it is already
-  // initialized, the previous value is discarded or overwritten.  The struct is initialized to
-  // the type's default state (all-zero).  Use getStructField() if you want the struct to be
-  // initialized as a copy of the field's default value (which may have non-null pointers).
+  KJ_ALWAYS_INLINE(PointerBuilder getPointerField(WirePointerCount ptrIndex));
+  // Get a builder for a pointer field given the index within the pointer section.
 
-  StructBuilder getStructField(WirePointerCount ptrIndex, StructSize size,
-                               const word* defaultValue);
-  // Gets the struct field at the given index in the pointer section.  If the field is not already
-  // initialized, it is initialized as a deep copy of the given default value (a flat message),
-  // or to the empty state if defaultValue is nullptr.
-
-  ListBuilder initListField(WirePointerCount ptrIndex, FieldSize elementSize,
-                            ElementCount elementCount);
-  // Allocates a new list of the given size for the field at the given index in the pointer
-  // segment, and return a pointer to it.  All elements are initialized to zero.
-
-  ListBuilder initStructListField(WirePointerCount ptrIndex, ElementCount elementCount,
-                                  StructSize size);
-  // Allocates a new list of the given size for the field at the given index in the pointer
-  // segment, and return a pointer to it.  Each element is initialized to its empty state.
-
-  ListBuilder getListField(WirePointerCount ptrIndex, FieldSize elementSize,
-                           const word* defaultValue);
-  // Gets the already-allocated list field for the given pointer index, ensuring that the list is
-  // suitable for storing non-struct elements of the given size.  If the list is not already
-  // allocated, it is allocated as a deep copy of the given default value (a flat message).  If
-  // the default value is null, an empty list is used.
-
-  ListBuilder getStructListField(WirePointerCount ptrIndex, StructSize elementSize,
-                                 const word* defaultValue);
-  // Gets the already-allocated list field for the given pointer index, ensuring that the list
-  // is suitable for storing struct elements of the given size.  If the list is not
-  // already allocated, it is allocated as a deep copy of the given default value (a flat
-  // message).  If the default value is null, an empty list is used.
-
-  template <typename T>
-  typename T::Builder initBlobField(WirePointerCount ptrIndex, ByteCount size);
-  // Initialize a Text or Data field to the given size in bytes (not including NUL terminator for
-  // Text) and return a Text::Builder which can be used to fill in the content.
-
-  template <typename T>
-  void setBlobField(WirePointerCount ptrIndex, typename T::Reader value);
-  // Set the blob field to a copy of the given blob.
-
-  template <typename T>
-  typename T::Builder getBlobField(WirePointerCount ptrIndex,
-                                   const void* defaultValue, ByteCount defaultSize);
-  // Get the blob field.  If it is not initialized, initialize it to a copy of the given default.
-
-  ObjectBuilder getObjectField(WirePointerCount ptrIndex, const word* defaultValue);
-  // Read a pointer of arbitrary type.
-
-  void setStructField(WirePointerCount ptrIndex, StructReader value);
-  void setListField(WirePointerCount ptrIndex, ListReader value);
-  void setObjectField(WirePointerCount ptrIndex, ObjectReader value);
-  // Sets a pointer field to a deep copy of the given value.
-
-  void adopt(WirePointerCount ptrIndex, OrphanBuilder&& orphan);
-  // Adopt the orphaned object as the value of the given pointer field.  The orphan must reside in
-  // the same message as the new parent.  No copying occurs.
-
-  OrphanBuilder disown(WirePointerCount ptrIndex);
-  // Detach the given pointer field from this object.  The pointer becomes null, and the child
-  // object is returned as an orphan.
+  void clearAll();
+  // Clear all pointers and data.
 
   void transferContentFrom(StructBuilder other);
   // Adopt all pointers from `other`, and also copy all data.  If `other`'s sections are larger
   // than this, the extra data is not transferred, meaning there is a risk of data loss when
   // transferring from messages built with future versions of the protocol.
 
-  bool isPointerFieldNull(WirePointerCount ptrIndex);
+  void copyContentFrom(StructReader other);
+  // Copy content from `other`.  If `other`'s sections are larger than this, the extra data is not
+  // copied, meaning there is a risk of data loss when copying from messages built with future
+  // versions of the protocol.
 
   StructReader asReader() const;
   // Gets a StructReader pointing at the same memory.
@@ -409,12 +497,15 @@ public:
       : segment(nullptr), data(nullptr), pointers(nullptr), dataSize(0),
         pointerCount(0), bit0Offset(0), nestingLimit(0x7fffffff) {}
 
-  static StructReader readRootUnchecked(const word* location);
-  static StructReader readRoot(const word* location, SegmentReader* segment, int nestingLimit);
+  const void* getLocation() const { return data; }
 
   inline BitCount getDataSectionSize() const { return dataSize; }
   inline WirePointerCount getPointerSectionSize() const { return pointerCount; }
   inline Data::Reader getDataSectionAsBlob();
+
+  template <typename T>
+  KJ_ALWAYS_INLINE(bool hasDataField(ElementCount offset) const);
+  // Return true if the field is set to something other than its default value.
 
   template <typename T>
   KJ_ALWAYS_INLINE(T getDataField(ElementCount offset) const);
@@ -428,33 +519,11 @@ public:
   // Like getDataField(offset), but applies the given XOR mask to the result.  Used for reading
   // fields with non-zero default values.
 
-  StructReader getStructField(WirePointerCount ptrIndex, const word* defaultValue) const;
-  // Get the struct field at the given index in the pointer section, or the default value if not
-  // initialized.  defaultValue will be interpreted as a flat message -- it must point at a
-  // struct pointer, which in turn points at the struct value.  The default value is allowed to
-  // be null, in which case an empty struct is used.
+  KJ_ALWAYS_INLINE(PointerReader getPointerField(WirePointerCount ptrIndex) const);
+  // Get a reader for a pointer field given the index within the pointer section.  If the index
+  // is out-of-bounds, returns a null pointer.
 
-  ListReader getListField(WirePointerCount ptrIndex, FieldSize expectedElementSize,
-                          const word* defaultValue) const;
-  // Get the list field at the given index in the pointer section, or the default value if not
-  // initialized.  The default value is allowed to be null, in which case an empty list is used.
-
-  template <typename T>
-  typename T::Reader getBlobField(WirePointerCount ptrIndex,
-                                  const void* defaultValue, ByteCount defaultSize) const;
-  // Gets the text or data field, or the given default value if not initialized.
-
-  ObjectReader getObjectField(WirePointerCount ptrIndex, const word* defaultValue) const;
-  // Read a pointer of arbitrary type.
-
-  const word* getUncheckedPointer(WirePointerCount ptrIndex) const;
-  // If this is an unchecked message, get a word* pointing at the location of the pointer.  This
-  // word* can actually be passed to readUnchecked() to read the designated sub-object later.  If
-  // this isn't an unchecked message, throws an exception.
-
-  bool isPointerFieldNull(WirePointerCount ptrIndex) const;
-
-  WordCount64 totalSize() const;
+  MessageSizeCounts totalSize() const;
   // Return the total size of the struct and everything to which it points.  Does not count far
   // pointer overhead.  This is useful for deciding how much space is needed to copy the struct
   // into a flat array.  However, the caller is advised NOT to treat this value as secure.  Instead,
@@ -508,6 +577,17 @@ public:
       : segment(nullptr), ptr(nullptr), elementCount(0 * ELEMENTS),
         step(0 * BITS / ELEMENTS) {}
 
+  inline word* getLocation() {
+    // Get the object's location.  Only valid for independently-allocated objects (i.e. not list
+    // elements).
+
+    if (step * ELEMENTS <= BITS_PER_WORD * WORDS) {
+      return reinterpret_cast<word*>(ptr);
+    } else {
+      return reinterpret_cast<word*>(ptr) - POINTER_SIZE_IN_WORDS;
+    }
+  }
+
   inline ElementCount size() const;
   // The number of elements in the list.
 
@@ -524,56 +604,9 @@ public:
       ElementCount index, kj::NoInfer<T> value));
   // Set the element at the given index.
 
+  KJ_ALWAYS_INLINE(PointerBuilder getPointerElement(ElementCount index));
+
   StructBuilder getStructElement(ElementCount index);
-  // Get the struct element at the given index.
-
-  ListBuilder initListElement(
-      ElementCount index, FieldSize elementSize, ElementCount elementCount);
-  // Create a new list element of the given size at the given index.  All elements are initialized
-  // to zero.
-
-  ListBuilder initStructListElement(ElementCount index, ElementCount elementCount,
-                                    StructSize size);
-  // Allocates a new list of the given size for the field at the given index in the pointer
-  // segment, and return a pointer to it.  Each element is initialized to its empty state.
-
-  ListBuilder getListElement(ElementCount index, FieldSize elementSize);
-  // Get the existing list element at the given index, making sure it is suitable for storing
-  // non-struct elements of the given size.  Returns an empty list if the element is not
-  // initialized.
-
-  ListBuilder getStructListElement(ElementCount index, StructSize elementSize);
-  // Get the existing list element at the given index, making sure it is suitable for storing
-  // struct elements of the given size.  Returns an empty list if the element is not
-  // initialized.
-
-  template <typename T>
-  typename T::Builder initBlobElement(ElementCount index, ByteCount size);
-  // Initialize a Text or Data element to the given size in bytes (not including NUL terminator for
-  // Text) and return a Text::Builder which can be used to fill in the content.
-
-  template <typename T>
-  void setBlobElement(ElementCount index, typename T::Reader value);
-  // Set the blob element to a copy of the given blob.
-
-  template <typename T>
-  typename T::Builder getBlobElement(ElementCount index);
-  // Get the blob element.  If it is not initialized, return an empty blob builder.
-
-  ObjectBuilder getObjectElement(ElementCount index);
-  // Gets a pointer element of arbitrary type.
-
-  void setListElement(ElementCount index, ListReader value);
-  void setObjectElement(ElementCount index, ObjectReader value);
-  // Sets a pointer element to a deep copy of the given value.
-
-  void adopt(ElementCount index, OrphanBuilder&& orphan);
-  // Adopt the orphaned object as the value of the given pointer field.  The orphan must reside in
-  // the same message as the new parent.  No copying occurs.
-
-  OrphanBuilder disown(ElementCount index);
-  // Detach the given pointer field from this object.  The pointer becomes null, and the child
-  // object is returned as an orphan.
 
   ListReader asReader() const;
   // Get a ListReader pointing at the same memory.
@@ -625,18 +658,9 @@ public:
   KJ_ALWAYS_INLINE(T getDataElement(ElementCount index) const);
   // Get the element of the given type at the given index.
 
+  KJ_ALWAYS_INLINE(PointerReader getPointerElement(ElementCount index) const);
+
   StructReader getStructElement(ElementCount index) const;
-  // Get the struct element at the given index.
-
-  ListReader getListElement(ElementCount index, FieldSize expectedElementSize) const;
-  // Get the list element at the given index.
-
-  template <typename T>
-  typename T::Reader getBlobElement(ElementCount index) const;
-  // Gets the text or data field.  If it is not initialized, returns an empty blob reader.
-
-  ObjectReader getObjectElement(ElementCount index) const;
-  // Gets a pointer element of arbitrary type.
 
 private:
   SegmentReader* segment;  // Memory segment in which the list resides.
@@ -673,54 +697,12 @@ private:
 
 // -------------------------------------------------------------------
 
-enum class ObjectKind {
-  NULL_POINTER,   // Object was read from a null pointer.
-  STRUCT,
-  LIST
-};
-
-struct ObjectBuilder {
-  // A reader for any kind of object.
-
-  ObjectKind kind;
-
-  union {
-    StructBuilder structBuilder;
-    ListBuilder listBuilder;
-  };
-
-  ObjectBuilder(): kind(ObjectKind::NULL_POINTER), structBuilder() {}
-  ObjectBuilder(StructBuilder structBuilder)
-      : kind(ObjectKind::STRUCT), structBuilder(structBuilder) {}
-  ObjectBuilder(ListBuilder listBuilder)
-      : kind(ObjectKind::LIST), listBuilder(listBuilder) {}
-};
-
-struct ObjectReader {
-  // A reader for any kind of object.
-
-  ObjectKind kind;
-
-  union {
-    StructReader structReader;
-    ListReader listReader;
-  };
-
-  ObjectReader(): kind(ObjectKind::NULL_POINTER), structReader() {}
-  ObjectReader(StructReader structReader)
-      : kind(ObjectKind::STRUCT), structReader(structReader) {}
-  ObjectReader(ListReader listReader)
-      : kind(ObjectKind::LIST), listReader(listReader) {}
-};
-
-// -------------------------------------------------------------------
-
 class OrphanBuilder {
 public:
   inline OrphanBuilder(): segment(nullptr), location(nullptr) { memset(&tag, 0, sizeof(tag)); }
   OrphanBuilder(const OrphanBuilder& other) = delete;
-  inline OrphanBuilder(OrphanBuilder&& other);
-  inline ~OrphanBuilder();
+  inline OrphanBuilder(OrphanBuilder&& other) noexcept;
+  inline ~OrphanBuilder() noexcept(false);
 
   static OrphanBuilder initStruct(BuilderArena* arena, StructSize size);
   static OrphanBuilder initList(BuilderArena* arena, ElementCount elementCount,
@@ -732,14 +714,16 @@ public:
 
   static OrphanBuilder copy(BuilderArena* arena, StructReader copyFrom);
   static OrphanBuilder copy(BuilderArena* arena, ListReader copyFrom);
+  static OrphanBuilder copy(BuilderArena* arena, PointerReader copyFrom);
   static OrphanBuilder copy(BuilderArena* arena, Text::Reader copyFrom);
   static OrphanBuilder copy(BuilderArena* arena, Data::Reader copyFrom);
+  static OrphanBuilder copy(BuilderArena* arena, kj::Own<ClientHook> copyFrom);
 
   OrphanBuilder& operator=(const OrphanBuilder& other) = delete;
   inline OrphanBuilder& operator=(OrphanBuilder&& other);
 
-  inline bool operator==(decltype(nullptr)) { return location == nullptr; }
-  inline bool operator!=(decltype(nullptr)) { return location != nullptr; }
+  inline bool operator==(decltype(nullptr)) const { return location == nullptr; }
+  inline bool operator!=(decltype(nullptr)) const { return location != nullptr; }
 
   StructBuilder asStruct(StructSize size);
   // Interpret as a struct, or throw an exception if not a struct.
@@ -755,14 +739,11 @@ public:
   Data::Builder asData();
   // Interpret as a blob, or throw an exception if not a blob.
 
-  ObjectBuilder asObject();
-  // Interpret as an arbitrary object.
-
   StructReader asStructReader(StructSize size) const;
   ListReader asListReader(FieldSize elementSize) const;
+  kj::Own<ClientHook> asCapability() const;
   Text::Reader asTextReader() const;
   Data::Reader asDataReader() const;
-  ObjectReader asObjectReader() const;
 
 private:
   static_assert(1 * POINTERS * WORDS_PER_POINTER == 1 * WORDS,
@@ -781,7 +762,8 @@ private:
   // FAR pointer.
 
   word* location;
-  // Pointer to the object, or null if the tag is a FAR pointer.
+  // Pointer to the object, or nullptr if the pointer is null.  For capabilities, we make this
+  // point at `tag` just so that it is non-null for operator==, but it is never used.
 
   inline OrphanBuilder(const void* tagPtr, SegmentBuilder* segment, word* location)
       : segment(segment), location(location) {
@@ -801,8 +783,39 @@ private:
 // =======================================================================================
 // Internal implementation details...
 
+// These are defined in the source file.
+template <> typename Text::Builder PointerBuilder::initBlob<Text>(ByteCount size);
+template <> void PointerBuilder::setBlob<Text>(typename Text::Reader value);
+template <> typename Text::Builder PointerBuilder::getBlob<Text>(const void* defaultValue, ByteCount defaultSize);
+template <> typename Text::Reader PointerReader::getBlob<Text>(const void* defaultValue, ByteCount defaultSize) const;
+
+template <> typename Data::Builder PointerBuilder::initBlob<Data>(ByteCount size);
+template <> void PointerBuilder::setBlob<Data>(typename Data::Reader value);
+template <> typename Data::Builder PointerBuilder::getBlob<Data>(const void* defaultValue, ByteCount defaultSize);
+template <> typename Data::Reader PointerReader::getBlob<Data>(const void* defaultValue, ByteCount defaultSize) const;
+
+inline PointerBuilder PointerBuilder::getRoot(SegmentBuilder* segment, word* location) {
+  return PointerBuilder(segment, reinterpret_cast<WirePointer*>(location));
+}
+
+inline PointerReader PointerReader::getRootUnchecked(const word* location) {
+  return PointerReader(nullptr, reinterpret_cast<const WirePointer*>(location), 0x7fffffff);
+}
+
+// -------------------------------------------------------------------
+
 inline Data::Builder StructBuilder::getDataSectionAsBlob() {
   return Data::Builder(reinterpret_cast<byte*>(data), dataSize / BITS_PER_BYTE / BYTES);
+}
+
+template <typename T>
+inline bool StructBuilder::hasDataField(ElementCount offset) {
+  return getDataField<Mask<T>>(offset) != 0;
+}
+
+template <>
+inline bool StructBuilder::hasDataField<Void>(ElementCount offset) {
+  return false;
 }
 
 template <typename T>
@@ -821,7 +834,7 @@ inline bool StructBuilder::getDataField<bool>(ElementCount offset) {
 
 template <>
 inline Void StructBuilder::getDataField<Void>(ElementCount offset) {
-  return Void::VOID;
+  return VOID;
 }
 
 template <typename T>
@@ -853,6 +866,12 @@ inline void StructBuilder::setDataField(ElementCount offset, kj::NoInfer<T> valu
   setDataField<Mask<T> >(offset, mask<T>(value, m));
 }
 
+inline PointerBuilder StructBuilder::getPointerField(WirePointerCount ptrIndex) {
+  // Hacky because WirePointer is defined in the .c++ file (so is incomplete here).
+  return PointerBuilder(segment, reinterpret_cast<WirePointer*>(
+      reinterpret_cast<word*>(pointers) + ptrIndex * WORDS_PER_POINTER));
+}
+
 // -------------------------------------------------------------------
 
 inline Data::Reader StructReader::getDataSectionAsBlob() {
@@ -860,7 +879,17 @@ inline Data::Reader StructReader::getDataSectionAsBlob() {
 }
 
 template <typename T>
-T StructReader::getDataField(ElementCount offset) const {
+inline bool StructReader::hasDataField(ElementCount offset) const {
+  return getDataField<Mask<T>>(offset) != 0;
+}
+
+template <>
+inline bool StructReader::hasDataField<Void>(ElementCount offset) const {
+  return false;
+}
+
+template <typename T>
+inline T StructReader::getDataField(ElementCount offset) const {
   if ((offset + 1 * ELEMENTS) * capnp::bitsPerElement<T>() <= dataSize) {
     return reinterpret_cast<const WireValue<T>*>(data)[offset / ELEMENTS].get();
   } else {
@@ -885,12 +914,22 @@ inline bool StructReader::getDataField<bool>(ElementCount offset) const {
 
 template <>
 inline Void StructReader::getDataField<Void>(ElementCount offset) const {
-  return Void::VOID;
+  return VOID;
 }
 
 template <typename T>
 T StructReader::getDataField(ElementCount offset, Mask<T> mask) const {
   return unmask<T>(getDataField<Mask<T> >(offset), mask);
+}
+
+inline PointerReader StructReader::getPointerField(WirePointerCount ptrIndex) const {
+  if (ptrIndex < pointerCount) {
+    // Hacky because WirePointer is defined in the .c++ file (so is incomplete here).
+    return PointerReader(segment, reinterpret_cast<const WirePointer*>(
+        reinterpret_cast<const word*>(pointers) + ptrIndex * WORDS_PER_POINTER), nestingLimit);
+  } else{
+    return PointerReader();
+  }
 }
 
 // -------------------------------------------------------------------
@@ -901,7 +940,7 @@ template <typename T>
 inline T ListBuilder::getDataElement(ElementCount index) {
   return reinterpret_cast<WireValue<T>*>(ptr + index * step / BITS_PER_BYTE)->get();
 
-  // TODO(soon):  Benchmark this alternate implementation, which I suspect may make better use of
+  // TODO(perf):  Benchmark this alternate implementation, which I suspect may make better use of
   //   the x86 SIB byte.  Also use it for all the other getData/setData implementations below, and
   //   the various non-inline methods that look up pointers.
   //   Also if using this, consider changing ptr back to void* instead of byte*.
@@ -919,7 +958,7 @@ inline bool ListBuilder::getDataElement<bool>(ElementCount index) {
 
 template <>
 inline Void ListBuilder::getDataElement<Void>(ElementCount index) {
-  return Void::VOID;
+  return VOID;
 }
 
 template <typename T>
@@ -940,6 +979,11 @@ inline void ListBuilder::setDataElement<bool>(ElementCount index, bool value) {
 template <>
 inline void ListBuilder::setDataElement<Void>(ElementCount index, Void value) {}
 
+inline PointerBuilder ListBuilder::getPointerElement(ElementCount index) {
+  return PointerBuilder(segment,
+      reinterpret_cast<WirePointer*>(ptr + index * step / BITS_PER_BYTE));
+}
+
 // -------------------------------------------------------------------
 
 inline ElementCount ListReader::size() const { return elementCount; }
@@ -959,38 +1003,24 @@ inline bool ListReader::getDataElement<bool>(ElementCount index) const {
 
 template <>
 inline Void ListReader::getDataElement<Void>(ElementCount index) const {
-  return Void::VOID;
+  return VOID;
 }
 
-// These are defined in the source file.
-template <> typename Text::Builder StructBuilder::initBlobField<Text>(WirePointerCount ptrIndex, ByteCount size);
-template <> void StructBuilder::setBlobField<Text>(WirePointerCount ptrIndex, typename Text::Reader value);
-template <> typename Text::Builder StructBuilder::getBlobField<Text>(WirePointerCount ptrIndex, const void* defaultValue, ByteCount defaultSize);
-template <> typename Text::Reader StructReader::getBlobField<Text>(WirePointerCount ptrIndex, const void* defaultValue, ByteCount defaultSize) const;
-template <> typename Text::Builder ListBuilder::initBlobElement<Text>(ElementCount index, ByteCount size);
-template <> void ListBuilder::setBlobElement<Text>(ElementCount index, typename Text::Reader value);
-template <> typename Text::Builder ListBuilder::getBlobElement<Text>(ElementCount index);
-template <> typename Text::Reader ListReader::getBlobElement<Text>(ElementCount index) const;
-
-template <> typename Data::Builder StructBuilder::initBlobField<Data>(WirePointerCount ptrIndex, ByteCount size);
-template <> void StructBuilder::setBlobField<Data>(WirePointerCount ptrIndex, typename Data::Reader value);
-template <> typename Data::Builder StructBuilder::getBlobField<Data>(WirePointerCount ptrIndex, const void* defaultValue, ByteCount defaultSize);
-template <> typename Data::Reader StructReader::getBlobField<Data>(WirePointerCount ptrIndex, const void* defaultValue, ByteCount defaultSize) const;
-template <> typename Data::Builder ListBuilder::initBlobElement<Data>(ElementCount index, ByteCount size);
-template <> void ListBuilder::setBlobElement<Data>(ElementCount index, typename Data::Reader value);
-template <> typename Data::Builder ListBuilder::getBlobElement<Data>(ElementCount index);
-template <> typename Data::Reader ListReader::getBlobElement<Data>(ElementCount index) const;
+inline PointerReader ListReader::getPointerElement(ElementCount index) const {
+  return PointerReader(segment,
+      reinterpret_cast<const WirePointer*>(ptr + index * step / BITS_PER_BYTE), nestingLimit);
+}
 
 // -------------------------------------------------------------------
 
-inline OrphanBuilder::OrphanBuilder(OrphanBuilder&& other)
+inline OrphanBuilder::OrphanBuilder(OrphanBuilder&& other) noexcept
     : segment(other.segment), location(other.location) {
   memcpy(&tag, &other.tag, sizeof(tag));  // Needs memcpy to comply with aliasing rules.
   other.segment = nullptr;
   other.location = nullptr;
 }
 
-inline OrphanBuilder::~OrphanBuilder() {
+inline OrphanBuilder::~OrphanBuilder() noexcept(false) {
   if (segment != nullptr) euthanize();
 }
 

@@ -30,6 +30,20 @@
 #include "dynamic.h"
 #include <gtest/gtest.h>
 
+#if KJ_NO_EXCEPTIONS
+#undef EXPECT_ANY_THROW
+#define EXPECT_ANY_THROW(code) EXPECT_DEATH(code, ".")
+#endif
+
+#define EXPECT_NONFATAL_FAILURE(code) \
+  EXPECT_TRUE(kj::runCatchingExceptions([&]() { code; }) != nullptr);
+
+#ifdef KJ_DEBUG
+#define EXPECT_DEBUG_ANY_THROW EXPECT_ANY_THROW
+#else
+#define EXPECT_DEBUG_ANY_THROW(EXP)
+#endif
+
 namespace capnp {
 
 inline std::ostream& operator<<(std::ostream& os, const Data::Reader& value) {
@@ -140,6 +154,121 @@ void checkList(T reader, std::initializer_list<ReaderFor<Element>> expected) {
 }
 
 #undef as
+
+// =======================================================================================
+// Interface implementations.
+
+class TestInterfaceImpl final: public test::TestInterface::Server {
+public:
+  TestInterfaceImpl(int& callCount);
+
+  kj::Promise<void> foo(FooContext context) override;
+
+  kj::Promise<void> baz(BazContext context) override;
+
+private:
+  int& callCount;
+};
+
+class TestExtendsImpl final: public test::TestExtends::Server {
+public:
+  TestExtendsImpl(int& callCount);
+
+  kj::Promise<void> foo(FooContext context) override;
+
+  kj::Promise<void> grault(GraultContext context) override;
+
+private:
+  int& callCount;
+};
+
+class TestPipelineImpl final: public test::TestPipeline::Server {
+public:
+  TestPipelineImpl(int& callCount);
+
+  kj::Promise<void> getCap(GetCapContext context) override;
+
+private:
+  int& callCount;
+};
+
+class TestCallOrderImpl final: public test::TestCallOrder::Server {
+public:
+  kj::Promise<void> getCallSequence(GetCallSequenceContext context) override;
+
+private:
+  uint count = 0;
+};
+
+class TestTailCallerImpl final: public test::TestTailCaller::Server {
+public:
+  TestTailCallerImpl(int& callCount);
+
+  kj::Promise<void> foo(FooContext context) override;
+
+private:
+  int& callCount;
+};
+
+class TestTailCalleeImpl final: public test::TestTailCallee::Server {
+public:
+  TestTailCalleeImpl(int& callCount);
+
+  kj::Promise<void> foo(FooContext context) override;
+
+private:
+  int& callCount;
+};
+
+class TestMoreStuffImpl final: public test::TestMoreStuff::Server {
+public:
+  TestMoreStuffImpl(int& callCount);
+
+  kj::Promise<void> getCallSequence(GetCallSequenceContext context) override;
+
+  kj::Promise<void> callFoo(CallFooContext context) override;
+
+  kj::Promise<void> callFooWhenResolved(CallFooWhenResolvedContext context) override;
+
+  kj::Promise<void> neverReturn(NeverReturnContext context) override;
+
+  kj::Promise<void> hold(HoldContext context) override;
+
+  kj::Promise<void> callHeld(CallHeldContext context) override;
+
+  kj::Promise<void> getHeld(GetHeldContext context) override;
+
+  kj::Promise<void> echo(EchoContext context) override;
+
+  kj::Promise<void> expectCancel(ExpectCancelContext context) override;
+
+private:
+  int& callCount;
+  test::TestInterface::Client clientToHold = nullptr;
+
+  kj::Promise<void> loop(uint depth, test::TestInterface::Client cap, ExpectCancelContext context);
+};
+
+class TestCapDestructor final: public test::TestInterface::Server {
+  // Implementation of TestInterface that notifies when it is destroyed.
+
+public:
+  TestCapDestructor(kj::Own<kj::PromiseFulfiller<void>>&& fulfiller)
+      : fulfiller(kj::mv(fulfiller)), impl(dummy) {}
+
+  ~TestCapDestructor() {
+    fulfiller->fulfill();
+  }
+
+  kj::Promise<void> foo(FooContext context) {
+    return impl.foo(context);
+  }
+
+private:
+  kj::Own<kj::PromiseFulfiller<void>> fulfiller;
+  int dummy = 0;
+  TestInterfaceImpl impl;
+};
 
 }  // namespace _ (private)
 }  // namespace capnp

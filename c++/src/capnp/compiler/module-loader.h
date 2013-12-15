@@ -25,6 +25,7 @@
 #define CAPNP_COMPILER_MODULE_LOADER_H_
 
 #include "compiler.h"
+#include "error-reporter.h"
 #include <kj/memory.h>
 #include <kj/array.h>
 #include <kj/string.h>
@@ -34,17 +35,17 @@ namespace compiler {
 
 class ModuleLoader {
 public:
-  explicit ModuleLoader(int errorFd);
-  // Create a ModuleLoader that writes error messages to the given file descriptor.
+  explicit ModuleLoader(GlobalErrorReporter& errorReporter);
+  // Create a ModuleLoader that reports error messages to the given reporter.
 
   KJ_DISALLOW_COPY(ModuleLoader);
 
-  ~ModuleLoader();
+  ~ModuleLoader() noexcept(false);
 
   void addImportPath(kj::String path);
   // Add a directory to the list of paths that is searched for imports that start with a '/'.
 
-  kj::Maybe<const Module&> loadModule(kj::StringPtr localName, kj::StringPtr sourceName) const;
+  kj::Maybe<Module&> loadModule(kj::StringPtr localName, kj::StringPtr sourceName);
   // Tries to load the module with the given filename.  `localName` is the path to the file on
   // disk (as you'd pass to open(2)), and `sourceName` is the canonical name it should be given
   // in the schema (this is used e.g. to decide output file locations).  Often, these are the same.

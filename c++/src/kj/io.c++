@@ -35,6 +35,16 @@ OutputStream::~OutputStream() noexcept(false) {}
 BufferedInputStream::~BufferedInputStream() noexcept(false) {}
 BufferedOutputStream::~BufferedOutputStream() noexcept(false) {}
 
+size_t InputStream::read(void* buffer, size_t minBytes, size_t maxBytes) {
+  size_t n = tryRead(buffer, minBytes, maxBytes);
+  KJ_REQUIRE(n >= minBytes, "Premature EOF") {
+    // Pretend we read zeros from the input.
+    memset(reinterpret_cast<byte*>(buffer) + n, 0, minBytes - n);
+    return minBytes;
+  }
+  return n;
+}
+
 void InputStream::skip(size_t bytes) {
   char scratch[8192];
   while (bytes > 0) {
@@ -50,6 +60,12 @@ void OutputStream::write(ArrayPtr<const ArrayPtr<const byte>> pieces) {
   }
 }
 
+ArrayPtr<const byte> BufferedInputStream::getReadBuffer() {
+  auto result = tryGetReadBuffer();
+  KJ_REQUIRE(result.size() > 0, "Premature EOF");
+  return result;
+}
+
 // =======================================================================================
 
 BufferedInputStreamWrapper::BufferedInputStreamWrapper(InputStream& inner, ArrayPtr<byte> buffer)
@@ -58,16 +74,16 @@ BufferedInputStreamWrapper::BufferedInputStreamWrapper(InputStream& inner, Array
 
 BufferedInputStreamWrapper::~BufferedInputStreamWrapper() noexcept(false) {}
 
-ArrayPtr<const byte> BufferedInputStreamWrapper::getReadBuffer() {
+ArrayPtr<const byte> BufferedInputStreamWrapper::tryGetReadBuffer() {
   if (bufferAvailable.size() == 0) {
-    size_t n = inner.read(buffer.begin(), 1, buffer.size());
+    size_t n = inner.tryRead(buffer.begin(), 1, buffer.size());
     bufferAvailable = buffer.slice(0, n);
   }
 
   return bufferAvailable;
 }
 
-size_t BufferedInputStreamWrapper::read(void* dst, size_t minBytes, size_t maxBytes) {
+size_t BufferedInputStreamWrapper::tryRead(void* dst, size_t minBytes, size_t maxBytes) {
   if (minBytes <= bufferAvailable.size()) {
     // Serve from current buffer.
     size_t n = std::min(bufferAvailable.size(), maxBytes);
@@ -174,20 +190,15 @@ void BufferedOutputStreamWrapper::write(const void* src, size_t size) {
 ArrayInputStream::ArrayInputStream(ArrayPtr<const byte> array): array(array) {}
 ArrayInputStream::~ArrayInputStream() noexcept(false) {}
 
-ArrayPtr<const byte> ArrayInputStream::getReadBuffer() {
+ArrayPtr<const byte> ArrayInputStream::tryGetReadBuffer() {
   return array;
 }
 
-size_t ArrayInputStream::read(void* dst, size_t minBytes, size_t maxBytes) {
+size_t ArrayInputStream::tryRead(void* dst, size_t minBytes, size_t maxBytes) {
   size_t n = std::min(maxBytes, array.size());
-  size_t result = n;
-  KJ_REQUIRE(n >= minBytes, "ArrayInputStream ended prematurely.") {
-    result = minBytes;  // garbage
-    break;
-  }
   memcpy(dst, array.begin(), n);
   array = array.slice(n, array.size());
-  return result;
+  return n;
 }
 
 void ArrayInputStream::skip(size_t bytes) {
@@ -222,19 +233,21 @@ void ArrayOutputStream::write(const void* src, size_t size) {
 // =======================================================================================
 
 AutoCloseFd::~AutoCloseFd() noexcept(false) {
-  unwindDetector.catchExceptionsIfUnwinding([&]() {
-    // Don't use SYSCALL() here because close() should not be repeated on EINTR.
-    if (fd >= 0 && close(fd) < 0) {
-      KJ_FAIL_SYSCALL("close", errno, fd) {
-        break;
+  if (fd >= 0) {
+    unwindDetector.catchExceptionsIfUnwinding([&]() {
+      // Don't use SYSCALL() here because close() should not be repeated on EINTR.
+      if (close(fd) < 0) {
+        KJ_FAIL_SYSCALL("close", errno, fd) {
+          break;
+        }
       }
-    }
-  });
+    });
+  }
 }
 
 FdInputStream::~FdInputStream() noexcept(false) {}
 
-size_t FdInputStream::read(void* buffer, size_t minBytes, size_t maxBytes) {
+size_t FdInputStream::tryRead(void* buffer, size_t minBytes, size_t maxBytes) {
   byte* pos = reinterpret_cast<byte*>(buffer);
   byte* min = pos + minBytes;
   byte* max = pos + maxBytes;
@@ -242,8 +255,8 @@ size_t FdInputStream::read(void* buffer, size_t minBytes, size_t maxBytes) {
   while (pos < min) {
     ssize_t n;
     KJ_SYSCALL(n = ::read(fd, pos, max - pos), fd);
-    KJ_REQUIRE(n > 0, "Premature EOF") {
-      return minBytes;
+    if (n == 0) {
+      break;
     }
     pos += n;
   }
@@ -282,11 +295,11 @@ void FdOutputStream::write(ArrayPtr<const ArrayPtr<const byte>> pieces) {
   }
 
   while (current < iov.end()) {
-    ssize_t n;
+    ssize_t n = 0;
     KJ_SYSCALL(n = ::writev(fd, current, iov.end() - current), fd);
     KJ_ASSERT(n > 0, "writev() returned zero.");
 
-    while (static_cast<size_t>(n) >= current->iov_len) {
+    while (n > 0 && static_cast<size_t>(n) >= current->iov_len) {
       n -= current->iov_len;
       ++current;
     }

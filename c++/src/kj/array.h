@@ -108,6 +108,17 @@ public:
                    size_t capacity, void (*destroyElement)(void*)) const override;
 };
 
+class NullArrayDisposer: public ArrayDisposer {
+  // An ArrayDisposer that does nothing.  Can be used to construct a fake Arrays that doesn't
+  // actually own its content.
+
+public:
+  static const NullArrayDisposer instance;
+
+  void disposeImpl(void* firstElement, size_t elementSize, size_t elementCount,
+                   size_t capacity, void (*destroyElement)(void*)) const override;
+};
+
 // =======================================================================================
 // Array
 
@@ -118,8 +129,8 @@ class Array {
   // single objects.
 
 public:
-  inline Array(): ptr(nullptr), size_(0) {}
-  inline Array(decltype(nullptr)): ptr(nullptr), size_(0) {}
+  inline Array(): ptr(nullptr), size_(0), disposer(nullptr) {}
+  inline Array(decltype(nullptr)): ptr(nullptr), size_(0), disposer(nullptr) {}
   inline Array(Array&& other) noexcept
       : ptr(other.ptr), size_(other.size_), disposer(other.disposer) {
     other.ptr = nullptr;
@@ -143,6 +154,9 @@ public:
     return ArrayPtr<T>(ptr, size_);
   }
   inline ArrayPtr<T> asPtr() {
+    return ArrayPtr<T>(ptr, size_);
+  }
+  inline ArrayPtr<const T> asPtr() const {
     return ArrayPtr<T>(ptr, size_);
   }
 
@@ -245,6 +259,7 @@ inline Array<T> heapArray(size_t size) {
 }
 
 template <typename T> Array<T> heapArray(const T* content, size_t size);
+template <typename T> Array<T> heapArray(ArrayPtr<T> content);
 template <typename T> Array<T> heapArray(ArrayPtr<const T> content);
 template <typename T, typename Iterator> Array<T> heapArray(Iterator begin, Iterator end);
 template <typename T> Array<T> heapArray(std::initializer_list<T> init);
@@ -339,6 +354,11 @@ public:
   template <typename Iterator>
   void addAll(Iterator start, Iterator end);
 
+  void removeLast() {
+    KJ_IREQUIRE(pos > ptr, "No elements present to remove.");
+    kj::dtor(*--pos);
+  }
+
   Array<T> finish() {
     // We could safely remove this check if we assume that the disposer implementation doesn't
     // need to know the original capacity, as is thes case with HeapArrayDisposer since it uses
@@ -428,7 +448,7 @@ public:
   inline explicit constexpr CappedArray(size_t s): currentSize(s) {}
 
   inline size_t size() const { return currentSize; }
-  inline void setSize(size_t s) { currentSize = s; }
+  inline void setSize(size_t s) { KJ_IREQUIRE(s <= fixedSize); currentSize = s; }
   inline T* begin() { return content; }
   inline T* end() { return content + currentSize; }
   inline const T* begin() const { return content; }
@@ -448,6 +468,36 @@ private:
   size_t currentSize;
   T content[fixedSize];
 };
+
+// =======================================================================================
+// KJ_MAP
+
+#define KJ_MAP(elementName, array) \
+  ::kj::_::Mapper<KJ_DECLTYPE_REF(array)>(array) * [&](decltype(*(array).begin()) elementName)
+// Applies some function to every element of an array, returning an Array of the results,  with
+// nice syntax.  Example:
+//
+//     StringPtr foo = "abcd";
+//     Array<char> bar = KJ_MAP(c, foo) -> char { return c + 1; };
+//     KJ_ASSERT(str(bar) == "bcde");
+
+namespace _ {  // private
+
+template <typename T>
+struct Mapper {
+  T array;
+  Mapper(T&& array): array(kj::fwd<T>(array)) {}
+  template <typename Func>
+  auto operator*(Func&& func) -> Array<decltype(func(*array.begin()))> {
+    auto builder = heapArrayBuilder<decltype(func(*array.begin()))>(array.size());
+    for (auto iter = array.begin(); iter != array.end(); ++iter) {
+      builder.add(func(*iter));
+    }
+    return builder.finish();
+  }
+};
+
+}  // namespace _ (private)
 
 // =======================================================================================
 // Inline implementation details
@@ -520,8 +570,7 @@ T* HeapArrayDisposer::allocateUninitialized(size_t count) {
   return Allocate_<T, true, true>::allocate(0, count);
 }
 
-template <typename Element, typename Iterator,
-          bool trivial = __has_trivial_copy(Element) && __has_trivial_assign(Element)>
+template <typename Element, typename Iterator, bool = canMemcpy<Element>()>
 struct CopyConstructArray_;
 
 template <typename T>
@@ -602,6 +651,13 @@ template <typename T>
 Array<T> heapArray(const T* content, size_t size) {
   ArrayBuilder<T> builder = heapArrayBuilder<T>(size);
   builder.addAll(content, content + size);
+  return builder.finish();
+}
+
+template <typename T>
+Array<T> heapArray(ArrayPtr<T> content) {
+  ArrayBuilder<T> builder = heapArrayBuilder<T>(content.size());
+  builder.addAll(content);
   return builder.finish();
 }
 
