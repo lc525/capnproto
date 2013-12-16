@@ -23,12 +23,12 @@ if (NOT USE_EXTERNAL_GTEST)
 
     ExternalProject_Get_Property(gtest source_dir)
     ExternalProject_Get_Property(gtest binary_dir)
-    set(gtest_library "${binary_dir}/libgtest.a")
-    set(gtest_main_library "${binary_dir}/libgtest_main.a")
-    set(gtest_include_dir ${source_dir}/include)
+    set(GTEST_LIBRARY "${binary_dir}/libgtest.a")
+    set(GTEST_MAIN_LIBRARY "${binary_dir}/libgtest_main.a")
+    set(GTEST_INCLUDE_DIRECTORIES ${source_dir}/include)
 endif()
 
-include_directories(${gtest_include_dir})
+include_directories(${GTEST_INCLUDE_DIRECTORIES})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/src)
 
