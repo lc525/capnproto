@@ -191,12 +191,12 @@ set(capnp_test_sources
 )
 
 add_executable(capnp-test ${capnp_test_sources})
-target_link_libraries(capnp-test ${gtest_library} ${gtest_main_library} capnpc capnp-rpc capnp kj-async kj)
+target_link_libraries(capnp-test ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} capnpc capnp-rpc capnp kj-async kj)
 add_test(capnp ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/capnp-test)
 add_dependencies(capnp-test capnp-exe capnpc-c++)
 
 add_executable(capnp-evolution-test src/capnp/compiler/evolution-test.c++)
-target_link_libraries(capnp-evolution-test ${gtest_library} ${gtest_main_library} capnpc capnp-rpc capnp kj-async kj)
+target_link_libraries(capnp-evolution-test ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} capnpc capnp-rpc capnp kj-async kj)
 add_test(capnp-evolution ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/capnp-evolution-test)
 
 if (NOT USE_EXTERNAL_GTEST)
