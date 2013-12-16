@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 2.8)
 project(capnproto CXX C)
 
+option(USE_EXTERNAL_GTEST "Use gtest from parent environment" OFF)
+
 set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../cmake)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
 
@@ -11,20 +13,22 @@ include(ExternalProject)
 include(CTest)
 enable_testing()
 
-ExternalProject_Add(gtest
-    DOWNLOAD_DIR ${CMAKE_CURRENT_BINARY_DIR}/gtest
-    SVN_REPOSITORY http://googletest.googlecode.com/svn/tags/release-1.7.0
-    UPDATE_COMMAND ""
-    CMAKE_ARGS -DCMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}
-    INSTALL_COMMAND ""
-)
+if (NOT USE_EXTERNAL_GTEST)
+    ExternalProject_Add(gtest
+        DOWNLOAD_DIR ${CMAKE_CURRENT_BINARY_DIR}/gtest
+        SVN_REPOSITORY http://googletest.googlecode.com/svn/tags/release-1.7.0
+        UPDATE_COMMAND ""
+        CMAKE_ARGS -DCMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}
+        INSTALL_COMMAND ""
+    )
 
-ExternalProject_Get_Property(gtest source_dir)
-ExternalProject_Get_Property(gtest binary_dir)
-set(gtest_library "${binary_dir}/libgtest.a")
-set(gtest_main_library "${binary_dir}/libgtest_main.a")
-set(gtest_both_libraries "${gtest_library};${gtest_main_library}")
-set(gtest_include_dir ${source_dir}/include)
+    ExternalProject_Get_Property(gtest source_dir)
+    ExternalProject_Get_Property(gtest binary_dir)
+    set(gtest_library "${binary_dir}/libgtest.a")
+    set(gtest_main_library "${binary_dir}/libgtest_main.a")
+    set(gtest_both_libraries "${gtest_library};${gtest_main_library}")
+    set(gtest_include_dir ${source_dir}/include)
+endif()
 
 include_directories(${gtest_include_dir})
 include_directories(src)
@@ -190,10 +194,13 @@ set(capnp_test_sources
 
 add_executable(capnp-test ${capnp_test_sources})
 target_link_libraries(capnp-test ${gtest_both_libraries} capnpc capnp-rpc capnp kj-async kj)
-add_dependencies(capnp-test gtest capnp-exe capnpc-c++)
 add_test(capnp ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/capnp-test)
 
 add_executable(capnp-evolution-test src/capnp/compiler/evolution-test.c++)
 target_link_libraries(capnp-evolution-test ${gtest_both_libraries} capnpc capnp-rpc capnp kj-async kj)
-add_dependencies(capnp-evolution-test gtest)
 add_test(capnp-evolution ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/capnp-evolution-test)
+
+if (NOT USE_EXTERNAL_GTEST)
+    add_dependencies(capnp-test gtest capnp-exe capnpc-c++)
+    add_dependencies(capnp-evolution-test gtest)
+endif()
