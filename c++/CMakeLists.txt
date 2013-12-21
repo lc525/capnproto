@@ -1,9 +1,27 @@
 project(capnproto CXX C)
 
-option(USE_EXTERNAL_GTEST "Use gtest from parent environment" OFF)
+option(USE_EXTERNAL_GTEST "Create external project for gtest, download and build it during `make`" ON)
 
-set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../cmake)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+if ("${CMAKE_BUILD_TYPE}" STREQUAL "")
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+if ("${BUILD_SHARED_LIBS}" STREQUAL "")
+    set(BUILD_SHARED_LIBS ON)
+endif()
+
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../cmake)
+list(APPEND CMAKE_CXX_FLAGS "-std=c++11")
+
+set(VERSION_MAJOR 0)
+set(VERSION_MINOR 5)
+execute_process(
+    COMMAND git --git-dir ${CMAKE_CURRENT_SOURCE_DIR}/../.git rev-parse --short HEAD
+    OUTPUT_VARIABLE GIT_REV
+)
+string(REPLACE "\n" "" GIT_REV ${GIT_REV})
+set(VERSION_PATCH ${GIT_REV})
+set(SO_VERSION "${VERSION_MAJOR}.${VERSION_MINOR}-${VERSION_PATCH}")
 
 find_package(Threads REQUIRED)
 link_libraries(${CMAKE_THREAD_LIBS_INIT}) # -lpthread(s) for all targets
@@ -11,13 +29,14 @@ link_libraries(${CMAKE_THREAD_LIBS_INIT}) # -lpthread(s) for all targets
 include(CTest)
 enable_testing()
 
-if (NOT USE_EXTERNAL_GTEST)
+if (USE_EXTERNAL_GTEST)
     include(ExternalProject)
     ExternalProject_Add(gtest
         DOWNLOAD_DIR ${CMAKE_CURRENT_BINARY_DIR}/gtest
         SVN_REPOSITORY http://googletest.googlecode.com/svn/tags/release-1.7.0
         UPDATE_COMMAND ""
         CMAKE_ARGS -DCMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}
+            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
         INSTALL_COMMAND ""
     )
 
@@ -26,6 +45,8 @@ if (NOT USE_EXTERNAL_GTEST)
     set(GTEST_LIBRARY "${binary_dir}/libgtest.a")
     set(GTEST_MAIN_LIBRARY "${binary_dir}/libgtest_main.a")
     set(GTEST_INCLUDE_DIRECTORIES ${source_dir}/include)
+else()
+    find_package(Gtest REQUIRED)
 endif()
 
 include_directories(${GTEST_INCLUDE_DIRECTORIES})
@@ -52,6 +73,7 @@ set(kj_sources
 
 add_library(kj ${kj_sources})
 target_link_libraries(kj)
+set_target_properties(kj PROPERTIES SOVERSION ${SO_VERSION})
 
 set(kj_async_sources
     src/kj/async.c++
@@ -61,6 +83,7 @@ set(kj_async_sources
 
 add_library(kj-async ${kj_async_sources})
 target_link_libraries(kj-async kj)
+set_target_properties(kj-async PROPERTIES SOVERSION ${SO_VERSION})
 
 
 set(capnp_sources
@@ -82,6 +105,7 @@ set(capnp_sources
 
 add_library(capnp ${capnp_sources})
 target_link_libraries(capnp kj)
+set_target_properties(capnp PROPERTIES SOVERSION ${SO_VERSION})
 
 
 set(capnp_rpc_sources
@@ -97,6 +121,7 @@ set(capnp_rpc_sources
 
 add_library(capnp-rpc ${capnp_rpc_sources})
 target_link_libraries(capnp-rpc capnp kj kj-async)
+set_target_properties(capnp-rpc PROPERTIES SOVERSION ${SO_VERSION})
 
 set(capnpc_sources
     src/capnp/compiler/md5.c++
@@ -112,6 +137,7 @@ set(capnpc_sources
 
 add_library(capnpc ${capnpc_sources})
 target_link_libraries(capnpc capnp kj)
+set_target_properties(capnpc PROPERTIES SOVERSION ${SO_VERSION})
 
 set(capnp_binary_sources
     src/capnp/compiler/module-loader.c++
@@ -190,6 +216,12 @@ set(capnp_test_sources
     src/capnp/compiler/md5-test.c++
 )
 
+install(TARGETS kj kj-async capnp capnp-rpc capnpc capnp-exe capnpc-capnp capnpc-c++
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+
 add_executable(capnp-test ${capnp_test_sources})
 target_link_libraries(capnp-test ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} capnpc capnp-rpc capnp kj-async kj)
 add_test(capnp ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/capnp-test)
@@ -199,7 +231,7 @@ add_executable(capnp-evolution-test src/capnp/compiler/evolution-test.c++)
 target_link_libraries(capnp-evolution-test ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} capnpc capnp-rpc capnp kj-async kj)
 add_test(capnp-evolution ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/capnp-evolution-test)
 
-if (NOT USE_EXTERNAL_GTEST)
+if (USE_EXTERNAL_GTEST)
     add_dependencies(capnp-test gtest)
     add_dependencies(capnp-evolution-test gtest)
 endif()
