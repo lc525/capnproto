@@ -1,3 +1,4 @@
+cmake_minimum_required(VERSION 2.8)
 project(capnproto CXX C)
 
 option(USE_EXTERNAL_GTEST "Create external project for gtest, download and build it during `make`" ON)
