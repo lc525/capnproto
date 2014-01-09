@@ -47,7 +47,7 @@ if (USE_EXTERNAL_GTEST)
     set(GTEST_MAIN_LIBRARY "${binary_dir}/libgtest_main.a")
     set(GTEST_INCLUDE_DIRECTORIES ${source_dir}/include)
 else()
-    find_package(Gtest REQUIRED)
+    find_package(GTest REQUIRED)
 endif()
 
 include_directories(${GTEST_INCLUDE_DIRECTORIES})
