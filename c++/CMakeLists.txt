@@ -1,7 +1,11 @@
 cmake_minimum_required(VERSION 2.8)
 project(capnproto CXX C)
 
-option(USE_EXTERNAL_GTEST "Create external project for gtest, download and build it during `make`" ON)
+option(USE_EXTERNAL_GTEST
+    "Create external project for gtest, download and build it during `make`" OFF)
+option(USE_SUBMODULE_GTEST
+    "GTest exists in current build tree, use it as regular cmake target.
+    All necessary include paths should be provided at the parent scope" OFF)
 
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "")
     set(CMAKE_BUILD_TYPE Release)
@@ -46,6 +50,9 @@ if (USE_EXTERNAL_GTEST)
     set(GTEST_LIBRARY "${binary_dir}/libgtest.a")
     set(GTEST_MAIN_LIBRARY "${binary_dir}/libgtest_main.a")
     set(GTEST_INCLUDE_DIRECTORIES ${source_dir}/include)
+elseif(USE_SUBMODULE_GTEST)
+    set(GTEST_LIBRARY gtest)
+    set(GTEST_MAIN_LIBRARY gtest_main)
 else()
     find_package(GTest REQUIRED)
 endif()
