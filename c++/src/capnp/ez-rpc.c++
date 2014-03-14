@@ -26,11 +26,12 @@
 #include <capnp/rpc.capnp.h>
 #include <kj/async-io.h>
 #include <kj/debug.h>
+#include <kj/threadlocal.h>
 #include <map>
 
 namespace capnp {
 
-static __thread EzRpcContext* threadEzContext = nullptr;
+KJ_THREADLOCAL_PTR(EzRpcContext) threadEzContext = nullptr;
 
 class EzRpcContext: public kj::Refcounted {
 public:
@@ -240,7 +241,7 @@ struct EzRpcServer::Impl final: public SturdyRefRestorer<Text>, public kj::TaskS
 
       // Arrange to destroy the server context when all references are gone, or when the
       // EzRpcServer is destroyed (which will destroy the TaskSet).
-      tasks.add(server->network.onDrained().attach(kj::mv(server)));
+      tasks.add(server->network.onDisconnect().attach(kj::mv(server)));
     })));
   }
 

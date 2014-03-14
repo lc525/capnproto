@@ -117,6 +117,8 @@ public:
   DynamicEnum() = default;
   inline DynamicEnum(EnumSchema::Enumerant enumerant)
       : schema(enumerant.getContainingEnum()), value(enumerant.getOrdinal()) {}
+  inline DynamicEnum(EnumSchema schema, uint16_t value)
+      : schema(schema), value(value) {}
 
   template <typename T, typename = kj::EnableIf<kind<T>() == Kind::ENUM>>
   inline DynamicEnum(T&& value): DynamicEnum(toDynamic(value)) {}
@@ -138,9 +140,6 @@ public:
 private:
   EnumSchema schema;
   uint16_t value;
-
-  inline DynamicEnum(EnumSchema schema, uint16_t value)
-      : schema(schema), value(value) {}
 
   uint16_t asImpl(uint64_t requestedTypeId) const;
 
@@ -923,6 +922,7 @@ public:
   template <typename T>
   Orphan(Orphan<T>&&);
   Orphan(Orphan<AnyPointer>&&);
+  Orphan(void*) = delete;  // So Orphan(bool) doesn't accept pointers.
   KJ_DISALLOW_COPY(Orphan);
 
   Orphan& operator=(Orphan&&) = default;
