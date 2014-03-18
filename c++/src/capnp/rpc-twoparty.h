@@ -50,12 +50,6 @@ public:
   kj::Promise<void> onDisconnect() { return disconnectPromise.addBranch(); }
   // Returns a promise that resolves when the peer disconnects.
 
-  kj::Promise<void> onDrained() { return drainedPromise.addBranch(); }
-  // Returns a promise that resolves once the peer has disconnected *and* all local objects
-  // referencing this connection have been destroyed.  A caller might use this to decide when it
-  // is safe to destroy the RpcSystem, if it isn't able to reliably destroy all objects using it
-  // directly.
-
   // implements VatNetwork -----------------------------------------------------
 
   kj::Maybe<kj::Own<TwoPartyVatNetworkBase::Connection>> connectToRefHost(
@@ -79,16 +73,23 @@ private:
   // second call on the server side.  Never fulfilled, because there is only one connection.
 
   kj::ForkedPromise<void> disconnectPromise = nullptr;
-  kj::Own<kj::PromiseFulfiller<void>> disconnectFulfiller;
-  kj::ForkedPromise<void> drainedPromise = nullptr;
 
   class FulfillerDisposer: public kj::Disposer {
+    // Hack:  TwoPartyVatNetwork is both a VatNetwork and a VatNetwork::Connection.  Whet the RPC
+    //   system detects (or initiates) a disconnection, it drops its reference to the Connection.
+    //   When all references have been dropped, then we want onDrained() to fire.  So we hand out
+    //   Own<Connection>s with this disposer attached, so that we can detect when they are dropped.
+
   public:
     mutable kj::Own<kj::PromiseFulfiller<void>> fulfiller;
+    mutable uint refcount = 0;
 
-    void disposeImpl(void* pointer) const override { fulfiller->fulfill(); }
+    void disposeImpl(void* pointer) const override;
   };
-  FulfillerDisposer drainedFulfiller;
+  FulfillerDisposer disconnectFulfiller;
+
+  kj::Own<TwoPartyVatNetworkBase::Connection> asConnection();
+  // Returns a pointer to this with the disposer set to drainedFulfiller.
 
   // implements Connection -----------------------------------------------------
 

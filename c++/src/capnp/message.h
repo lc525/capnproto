@@ -157,6 +157,7 @@ class MessageBuilder {
 public:
   MessageBuilder();
   virtual ~MessageBuilder() noexcept(false);
+  KJ_DISALLOW_COPY(MessageBuilder);
 
   virtual kj::ArrayPtr<word> allocateSegment(uint minimumSize) = 0;
   // Allocates an array of at least the given number of words, throwing an exception or crashing if
@@ -207,7 +208,7 @@ public:
   Orphanage getOrphanage();
 
 private:
-  void* arenaSpace[18];
+  void* arenaSpace[20];
   // Space in which we can construct a BuilderArena.  We don't use BuilderArena directly here
   // because we don't want clients to have to #include arena.h, which itself includes a bunch of
   // big STL headers.  We don't use a pointer to a BuilderArena because that would require an
