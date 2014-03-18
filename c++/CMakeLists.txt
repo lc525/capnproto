@@ -6,6 +6,9 @@ option(USE_EXTERNAL_GTEST
 option(USE_SUBMODULE_GTEST
     "GTest exists in current build tree, use it as regular cmake target.
     All necessary include paths should be provided at the parent scope" OFF)
+option(USE_EXTERNAL_CAPNP
+    "Use capnp compiler and c++ plugin passed in $CAPNP and $CAPNPC_CXX
+    environment variables respectively" OFF)
 
 if("${CMAKE_BUILD_TYPE}" STREQUAL "")
     set(CMAKE_BUILD_TYPE Release CACHE STRING "")
@@ -17,6 +20,7 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../cmake)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(VERSION_MAJOR 0)
 set(VERSION_MINOR 5)
@@ -78,11 +82,51 @@ set(kj_sources
     src/kj/parse/char.c++
 )
 
-add_library(kj ${kj_sources})
-target_link_libraries(kj)
-set_target_properties(kj PROPERTIES
-    VERSION ${VERSION}
-    SOVERSION ${SOVERSION}
+include(CMakeParseArguments)
+
+macro(library)
+    set(one_value_args NAME)
+    set(multi_value_args SOURCES DEPENDS)
+    cmake_parse_arguments(LIBRARY "" "${one_value_args}" "${multi_value_args}" ${ARGN})
+
+    add_library(${LIBRARY_NAME} OBJECT ${LIBRARY_SOURCES})
+    add_library(${LIBRARY_NAME}-shared SHARED $<TARGET_OBJECTS:${LIBRARY_NAME}>)
+    add_library(${LIBRARY_NAME}-static STATIC $<TARGET_OBJECTS:${LIBRARY_NAME}>)
+
+    set_target_properties(${LIBRARY_NAME}-shared PROPERTIES
+        OUTPUT_NAME ${LIBRARY_NAME}
+        VERSION ${VERSION}
+        SOVERSION ${SOVERSION}
+    )
+
+    set_target_properties(${LIBRARY_NAME}-static PROPERTIES
+        OUTPUT_NAME ${LIBRARY_NAME}
+    )
+
+    foreach(dep ${LIBRARY_DEPENDS})
+        target_link_libraries(${LIBRARY_NAME}-static ${dep}-static)
+        target_link_libraries(${LIBRARY_NAME}-shared ${dep}-shared)
+    endforeach()
+
+    install(TARGETS ${LIBRARY_NAME}-shared
+        EXPORT capnproto
+        COMPONENT SharedLibraries
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+    )
+
+    install(TARGETS ${LIBRARY_NAME}-static
+        EXPORT capnproto
+        COMPONENT StaticLibraries
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+    )
+
+endmacro()
+
+library(
+    NAME kj
+    SOURCES ${kj_sources}
 )
 
 set(kj_async_sources
@@ -91,13 +135,11 @@ set(kj_async_sources
     src/kj/async-io.c++
 )
 
-add_library(kj-async ${kj_async_sources})
-target_link_libraries(kj-async kj)
-set_target_properties(kj-async PROPERTIES
-    VERSION ${VERSION}
-    SOVERSION ${SOVERSION}
+library(
+    NAME kj-async
+    SOURCES ${kj_async_sources}
+    DEPENDS kj
 )
-
 
 set(capnp_sources
     src/capnp/c++.capnp.c++
@@ -116,14 +158,11 @@ set(capnp_sources
     src/capnp/serialize-packed.c++
 )
 
-add_library(capnp ${capnp_sources})
-target_link_libraries(capnp kj)
-set_target_properties(capnp PROPERTIES
-    VERSION ${VERSION}
-    SOVERSION ${SOVERSION}
+library(
+    NAME capnp
+    SOURCES ${capnp_sources}
+    DEPENDS kj
 )
-
-
 set(capnp_rpc_sources
     src/capnp/serialize-async.c++
     src/capnp/capability.c++
@@ -135,11 +174,10 @@ set(capnp_rpc_sources
     src/capnp/ez-rpc.c++
 )
 
-add_library(capnp-rpc ${capnp_rpc_sources})
-target_link_libraries(capnp-rpc capnp kj kj-async)
-set_target_properties(capnp-rpc PROPERTIES
-    VERSION ${VERSION}
-    SOVERSION ${SOVERSION}
+library(
+    NAME capnp-rpc
+    SOURCES ${capnp_rpc_sources}
+    DEPENDS kj kj-async capnp
 )
 
 set(capnpc_sources
@@ -154,11 +192,10 @@ set(capnpc_sources
     src/capnp/schema-parser.c++
 )
 
-add_library(capnpc ${capnpc_sources})
-target_link_libraries(capnpc capnp kj)
-set_target_properties(capnpc PROPERTIES
-    VERSION ${VERSION}
-    SOVERSION ${SOVERSION}
+library(
+    NAME capnpc
+    SOURCES ${capnpc_sources}
+    DEPENDS kj capnp
 )
 
 set(capnp_binary_sources
@@ -168,17 +205,119 @@ set(capnp_binary_sources
 
 add_executable(capnp-exe ${capnp_binary_sources})
 set_target_properties(capnp-exe PROPERTIES OUTPUT_NAME capnp)
-target_link_libraries(capnp-exe capnpc capnp kj)
+target_link_libraries(capnp-exe kj-shared capnp-shared capnpc-shared)
 
 add_executable(capnpc-capnp src/capnp/compiler/capnpc-capnp.c++)
-target_link_libraries(capnpc-capnp capnp kj)
+target_link_libraries(capnpc-capnp kj-shared capnp-shared)
 
 add_executable(capnpc-c++ src/capnp/compiler/capnpc-c++.c++)
-target_link_libraries(capnpc-c++ capnp kj)
+target_link_libraries(capnpc-c++ kj-shared capnp-shared)
 
+install(TARGETS
+    capnp-exe
+    capnpc-capnp
+    capnpc-c++
+    COMPONENT Compiler
+    RUNTIME DESTINATION bin
+)
 
-get_target_property(CAPNPC_EXECUTABLE capnp-exe LOCATION)
-get_target_property(CAPNPC_CXX_EXECUTABLE capnpc-c++ LOCATION)
+install(CODE "execute_process(
+    COMMAND \"${CMAKE_COMMAND}\" -E create_symlink capnp capnpc
+    COMMAND \"ldconfig </dev/null > /dev/null 2>&1\"
+    WORKING_DIRECTORY ${CMAKE_INSTALL_PREFIX}/bin
+    )"
+)
+
+set(CPACK_COMPONENT_COMPILER_DEPENDS SharedLibraries)
+
+install(FILES
+    src/capnp/any.h
+    src/capnp/blob.h
+    src/capnp/capability.h
+    src/capnp/c++.capnp
+    src/capnp/c++.capnp.h
+    src/capnp/common.h
+    src/capnp/dynamic.h
+    src/capnp/endian.h
+    src/capnp/ez-rpc.h
+    src/capnp/generated-header-support.h
+    src/capnp/layout.h
+    src/capnp/list.h
+    src/capnp/message.h
+    src/capnp/orphan.h
+    src/capnp/pointer-helpers.h
+    src/capnp/pretty-print.h
+    src/capnp/rpc.capnp.h
+    src/capnp/rpc.h
+    src/capnp/rpc-prelude.h
+    src/capnp/rpc-twoparty.capnp.h
+    src/capnp/rpc-twoparty.h
+    src/capnp/schema.capnp
+    src/capnp/schema.capnp.h
+    src/capnp/schema.h
+    src/capnp/schema-loader.h
+    src/capnp/schema-parser.h
+    src/capnp/serialize-async.h
+    src/capnp/serialize.h
+    src/capnp/serialize-packed.h
+    DESTINATION include/capnp
+    COMPONENT Headers
+)
+
+install(FILES
+    src/kj/arena.h
+    src/kj/array.h
+    src/kj/async.h
+    src/kj/async-inl.h
+    src/kj/async-io.h
+    src/kj/async-prelude.h
+    src/kj/async-unix.h
+    src/kj/common.h
+    src/kj/debug.h
+    src/kj/exception.h
+    src/kj/function.h
+    src/kj/io.h
+    src/kj/main.h
+    src/kj/memory.h
+    src/kj/mutex.h
+    src/kj/one-of.h
+    src/kj/refcount.h
+    src/kj/string.h
+    src/kj/string-tree.h
+    src/kj/thread.h
+    src/kj/threadlocal.h
+    src/kj/tuple.h
+    src/kj/units.h
+    src/kj/vector.h
+    DESTINATION include/kj
+    COMPONENT Headers
+)
+
+install(FILES
+    src/kj/parse/char.h
+    src/kj/parse/common.h
+    DESTINATION include/kj/parse
+    COMPONENT Headers
+)
+
+install(EXPORT capnproto
+    DESTINATION share/cmake
+    COMPONENT CMakeModules
+)
+
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/capnpc.cmake
+    DESTINATION share/cmake
+    COMPONENT CMakeModules
+)
+
+if(USE_EXTERNAL_CAPNP)
+    set(CAPNPC_EXECUTABLE "$ENV{CAPNP}" CACHE STRING "")
+    set(CAPNPC_CXX_EXECUTABLE "$ENV{CAPNPC_CXX}" CACHE STRING "")
+else()
+    get_target_property(CAPNPC_EXECUTABLE capnp-exe LOCATION)
+    get_target_property(CAPNPC_CXX_EXECUTABLE capnpc-c++ LOCATION)
+endif()
+
 set(CAPNPC_IMPORT_PATH ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 include(capnpc) # for capnp_generate_cpp()
@@ -238,19 +377,29 @@ set(capnp_test_sources
     src/capnp/compiler/md5-test.c++
 )
 
-install(TARGETS kj kj-async capnp capnp-rpc capnpc capnp-exe capnpc-capnp capnpc-c++
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib
-    RUNTIME DESTINATION bin
-)
-
 add_executable(capnp-test ${capnp_test_sources})
-target_link_libraries(capnp-test ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} capnpc capnp-rpc capnp kj-async kj)
+target_link_libraries(capnp-test
+    ${GTEST_LIBRARY}
+    ${GTEST_MAIN_LIBRARY}
+    kj-shared
+    kj-async-shared
+    capnp-shared
+    capnp-rpc-shared
+    capnpc-shared
+)
 add_test(capnp ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/capnp-test)
 add_dependencies(capnp-test capnp-exe capnpc-c++)
 
 add_executable(capnp-evolution-test src/capnp/compiler/evolution-test.c++)
-target_link_libraries(capnp-evolution-test ${GTEST_LIBRARY} ${GTEST_MAIN_LIBRARY} capnpc capnp-rpc capnp kj-async kj)
+target_link_libraries(capnp-evolution-test
+    ${GTEST_LIBRARY}
+    ${GTEST_MAIN_LIBRARY}
+    kj-shared
+    kj-async-shared
+    capnp-shared
+    capnp-rpc-shared
+    capnpc-shared
+)
 add_test(capnp-evolution ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/capnp-evolution-test)
 
 if(USE_EXTERNAL_GTEST)
