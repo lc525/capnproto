@@ -64,21 +64,21 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/src)
 
 set(kj_sources
-    src/kj/common.c++
-    src/kj/units.c++
-    src/kj/memory.c++
-    src/kj/refcount.c++
-    src/kj/array.c++
-    src/kj/string.c++
-    src/kj/string-tree.c++
-    src/kj/exception.c++
-    src/kj/debug.c++
     src/kj/arena.c++
+    src/kj/array.c++
+    src/kj/common.c++
+    src/kj/debug.c++
+    src/kj/exception.c++
     src/kj/io.c++
-    src/kj/mutex.c++
-    src/kj/thread.c++
     src/kj/main.c++
+    src/kj/memory.c++
+    src/kj/mutex.c++
     src/kj/parse/char.c++
+    src/kj/refcount.c++
+    src/kj/string-tree.c++
+    src/kj/string.c++
+    src/kj/thread.c++
+    src/kj/units.c++
 )
 
 include(CMakeParseArguments)
@@ -129,9 +129,9 @@ library(
 )
 
 set(kj_async_sources
-    src/kj/async.c++
-    src/kj/async-unix.c++
     src/kj/async-io.c++
+    src/kj/async-unix.c++
+    src/kj/async.c++
 )
 
 library(
@@ -141,20 +141,20 @@ library(
 )
 
 set(capnp_sources
-    src/capnp/c++.capnp.c++
-    src/capnp/blob.c++
+    src/capnp/any.c++
     src/capnp/arena.c++
+    src/capnp/blob.c++
+    src/capnp/c++.capnp.c++
+    src/capnp/dynamic.c++
     src/capnp/layout.c++
     src/capnp/list.c++
-    src/capnp/any.c++
     src/capnp/message.c++
-    src/capnp/schema.capnp.c++
-    src/capnp/schema.c++
     src/capnp/schema-loader.c++
-    src/capnp/dynamic.c++
-    src/capnp/stringify.c++
-    src/capnp/serialize.c++
+    src/capnp/schema.c++
+    src/capnp/schema.capnp.c++
     src/capnp/serialize-packed.c++
+    src/capnp/serialize.c++
+    src/capnp/stringify.c++
 )
 
 library(
@@ -163,14 +163,14 @@ library(
     DEPENDS kj
 )
 set(capnp_rpc_sources
-    src/capnp/serialize-async.c++
     src/capnp/capability.c++
     src/capnp/dynamic-capability.c++
-    src/capnp/rpc.c++
-    src/capnp/rpc.capnp.c++
+    src/capnp/ez-rpc.c++
     src/capnp/rpc-twoparty.c++
     src/capnp/rpc-twoparty.capnp.c++
-    src/capnp/ez-rpc.c++
+    src/capnp/rpc.c++
+    src/capnp/rpc.capnp.c++
+    src/capnp/serialize-async.c++
 )
 
 library(
@@ -180,14 +180,14 @@ library(
 )
 
 set(capnpc_sources
-    src/capnp/compiler/md5.c++
-    src/capnp/compiler/error-reporter.c++
-    src/capnp/compiler/lexer.capnp.c++
-    src/capnp/compiler/lexer.c++
-    src/capnp/compiler/grammar.capnp.c++
-    src/capnp/compiler/parser.c++
-    src/capnp/compiler/node-translator.c++
     src/capnp/compiler/compiler.c++
+    src/capnp/compiler/error-reporter.c++
+    src/capnp/compiler/grammar.capnp.c++
+    src/capnp/compiler/lexer.c++
+    src/capnp/compiler/lexer.capnp.c++
+    src/capnp/compiler/md5.c++
+    src/capnp/compiler/node-translator.c++
+    src/capnp/compiler/parser.c++
     src/capnp/schema-parser.c++
 )
 
@@ -232,9 +232,9 @@ set(CPACK_COMPONENT_COMPILER_DEPENDS SharedLibraries)
 install(FILES
     src/capnp/any.h
     src/capnp/blob.h
-    src/capnp/capability.h
     src/capnp/c++.capnp
     src/capnp/c++.capnp.h
+    src/capnp/capability.h
     src/capnp/common.h
     src/capnp/dynamic.h
     src/capnp/endian.h
@@ -246,19 +246,19 @@ install(FILES
     src/capnp/orphan.h
     src/capnp/pointer-helpers.h
     src/capnp/pretty-print.h
-    src/capnp/rpc.capnp.h
-    src/capnp/rpc.h
     src/capnp/rpc-prelude.h
     src/capnp/rpc-twoparty.capnp.h
     src/capnp/rpc-twoparty.h
+    src/capnp/rpc.capnp.h
+    src/capnp/rpc.h
+    src/capnp/schema-loader.h
+    src/capnp/schema-parser.h
     src/capnp/schema.capnp
     src/capnp/schema.capnp.h
     src/capnp/schema.h
-    src/capnp/schema-loader.h
-    src/capnp/schema-parser.h
     src/capnp/serialize-async.h
-    src/capnp/serialize.h
     src/capnp/serialize-packed.h
+    src/capnp/serialize.h
     DESTINATION include/capnp
     COMPONENT Headers
 )
@@ -266,11 +266,11 @@ install(FILES
 install(FILES
     src/kj/arena.h
     src/kj/array.h
-    src/kj/async.h
     src/kj/async-inl.h
     src/kj/async-io.h
     src/kj/async-prelude.h
     src/kj/async-unix.h
+    src/kj/async.h
     src/kj/common.h
     src/kj/debug.h
     src/kj/exception.h
@@ -281,10 +281,11 @@ install(FILES
     src/kj/mutex.h
     src/kj/one-of.h
     src/kj/refcount.h
-    src/kj/string.h
     src/kj/string-tree.h
+    src/kj/string.h
     src/kj/thread.h
     src/kj/threadlocal.h
+    src/kj/time.h
     src/kj/tuple.h
     src/kj/units.h
     src/kj/vector.h
@@ -313,8 +314,8 @@ if(USE_EXTERNAL_CAPNP)
     set(CAPNPC_EXECUTABLE "$ENV{CAPNP}" CACHE STRING "")
     set(CAPNPC_CXX_EXECUTABLE "$ENV{CAPNPC_CXX}" CACHE STRING "")
 else()
-    get_target_property(CAPNPC_EXECUTABLE capnp-exe LOCATION)
-    get_target_property(CAPNPC_CXX_EXECUTABLE capnpc-c++ LOCATION)
+    set(CAPNPC_EXECUTABLE $<TARGET_FILE:capnp-exe>)
+    set(CAPNPC_CXX_EXECUTABLE $<TARGET_FILE:capnpc-c++>)
 endif()
 
 set(CAPNPC_IMPORT_PATH ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -331,49 +332,52 @@ capnp_generate_cpp(test_capnpc_sources test_capnpc_headers ${test_capnpc_inputs}
 
 set(capnp_test_sources
     ${test_capnpc_sources}
-    src/kj/common-test.c++
-    src/kj/memory-test.c++
-    src/kj/refcount-test.c++
-    src/kj/array-test.c++
-    src/kj/string-test.c++
-    src/kj/string-tree-test.c++
-    src/kj/exception-test.c++
-    src/kj/debug-test.c++
     src/kj/arena-test.c++
-    src/kj/units-test.c++
-    src/kj/tuple-test.c++
-    src/kj/one-of-test.c++
-    src/kj/function-test.c++
-    src/kj/mutex-test.c++
+    src/kj/array-test.c++
+    src/kj/async-io-test.c++
     src/kj/async-test.c++
     src/kj/async-unix-test.c++
-    src/kj/async-io-test.c++
-    src/kj/parse/common-test.c++
+    src/kj/common-test.c++
+    src/kj/debug-test.c++
+    src/kj/exception-test.c++
+    src/kj/function-test.c++
+    src/kj/io-test.c++
+    src/kj/memory-test.c++
+    src/kj/mutex-test.c++
+    src/kj/one-of-test.c++
     src/kj/parse/char-test.c++
-    src/capnp/common-test.c++
-    src/capnp/blob-test.c++
-    src/capnp/endian-test.c++
-    src/capnp/endian-fallback-test.c++
-    src/capnp/endian-reverse-test.c++
-    src/capnp/layout-test.c++
+    src/kj/parse/common-test.c++
+    src/kj/refcount-test.c++
+    src/kj/string-test.c++
+    src/kj/string-tree-test.c++
+    src/kj/threadlocal-pthread-test.c++
+    src/kj/threadlocal-test.c++
+    src/kj/tuple-test.c++
+    src/kj/units-test.c++
     src/capnp/any-test.c++
-    src/capnp/message-test.c++
+    src/capnp/blob-test.c++
     src/capnp/capability-test.c++
-    src/capnp/schema-test.c++
-    src/capnp/schema-loader-test.c++
-    src/capnp/dynamic-test.c++
-    src/capnp/stringify-test.c++
-    src/capnp/encoding-test.c++
-    src/capnp/orphan-test.c++
-    src/capnp/serialize-test.c++
-    src/capnp/serialize-async-test.c++
-    src/capnp/serialize-packed-test.c++
-    src/capnp/rpc-test.c++
-    src/capnp/rpc-twoparty-test.c++
-    src/capnp/ez-rpc-test.c++
-    src/capnp/test-util.c++
+    src/capnp/common-test.c++
     src/capnp/compiler/lexer-test.c++
     src/capnp/compiler/md5-test.c++
+    src/capnp/dynamic-test.c++
+    src/capnp/encoding-test.c++
+    src/capnp/endian-fallback-test.c++
+    src/capnp/endian-reverse-test.c++
+    src/capnp/endian-test.c++
+    src/capnp/ez-rpc-test.c++
+    src/capnp/layout-test.c++
+    src/capnp/message-test.c++
+    src/capnp/orphan-test.c++
+    src/capnp/rpc-test.c++
+    src/capnp/rpc-twoparty-test.c++
+    src/capnp/schema-loader-test.c++
+    src/capnp/schema-test.c++
+    src/capnp/serialize-async-test.c++
+    src/capnp/serialize-packed-test.c++
+    src/capnp/serialize-test.c++
+    src/capnp/stringify-test.c++
+    src/capnp/test-util.c++
 )
 
 add_executable(capnp-test ${capnp_test_sources})
