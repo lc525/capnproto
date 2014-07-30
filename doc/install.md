@@ -38,8 +38,7 @@ The Cap'n Proto tools, including the compiler which takes `.capnp` files and gen
 for them, are written in C++.  Therefore, you must install the C++ package even if your actual
 development language is something else.
 
-This package is licensed under the
-[BSD 2-Clause License](http://opensource.org/licenses/BSD-2-Clause).
+This package is licensed under the [MIT License](http://opensource.org/licenses/MIT).
 
 ### GCC 4.7 or Clang 3.2 Needed
 
@@ -67,7 +66,7 @@ the upcoming CTPs (the November 2013 CTP is almost there).
 
 You may download and install the release version of Cap'n Proto like so:
 
-<pre><code>curl -O <a href="http://capnproto.org/capnproto-c++-0.0.0.tar.gz">http://capnproto.org/capnproto-c++-0.0.0.tar.gz</a>
+<pre><code>curl -O <a href="https://capnproto.org/capnproto-c++-0.0.0.tar.gz">https://capnproto.org/capnproto-c++-0.0.0.tar.gz</a>
 tar zxf capnproto-c++-0.0.0.tar.gz
 cd capnproto-c++-0.0.0
 ./configure

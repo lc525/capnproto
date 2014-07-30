@@ -1,31 +1,33 @@
-// Copyright (c) 2013, Kenton Varda <temporal@gmail.com>
-// All rights reserved.
+// Copyright (c) 2013-2014 Sandstorm Development Group, Inc. and contributors
+// Licensed under the MIT License:
 //
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
 //
-// 1. Redistributions of source code must retain the above copyright notice, this
-//    list of conditions and the following disclaimer.
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-//    this list of conditions and the following disclaimer in the documentation
-//    and/or other materials provided with the distribution.
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
 //
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-// WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
-// ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-// (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
-// ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
 
 #include "async-unix.h"
 #include "debug.h"
 #include "threadlocal.h"
 #include <setjmp.h>
 #include <errno.h>
+#include <inttypes.h>
+#include <limits>
+#include <set>
+#include <chrono>
 
 namespace kj {
 
@@ -77,6 +79,16 @@ void registerReservedSignal() {
 pthread_once_t registerReservedSignalOnce = PTHREAD_ONCE_INIT;
 
 }  // namespace
+
+// =======================================================================================
+
+struct UnixEventPort::TimerSet {
+  struct TimerBefore {
+    bool operator()(TimerPromiseAdapter* lhs, TimerPromiseAdapter* rhs);
+  };
+  using Timers = std::multiset<TimerPromiseAdapter*, TimerBefore>;
+  Timers timers;
+};
 
 // =======================================================================================
 
@@ -161,11 +173,43 @@ public:
   PollPromiseAdapter** prev = nullptr;
 };
 
-UnixEventPort::UnixEventPort() {
+class UnixEventPort::TimerPromiseAdapter {
+public:
+  TimerPromiseAdapter(PromiseFulfiller<void>& fulfiller, UnixEventPort& port, TimePoint time)
+      : time(time), fulfiller(fulfiller), port(port) {
+    pos = port.timers->timers.insert(this);
+  }
+
+  ~TimerPromiseAdapter() {
+    if (pos != port.timers->timers.end()) {
+      port.timers->timers.erase(pos);
+    }
+  }
+
+  void fulfill() {
+    fulfiller.fulfill();
+    port.timers->timers.erase(pos);
+    pos = port.timers->timers.end();
+  }
+
+  const TimePoint time;
+  PromiseFulfiller<void>& fulfiller;
+  UnixEventPort& port;
+  TimerSet::Timers::const_iterator pos;
+};
+
+bool UnixEventPort::TimerSet::TimerBefore::operator()(
+    TimerPromiseAdapter* lhs, TimerPromiseAdapter* rhs) {
+  return lhs->time < rhs->time;
+}
+
+UnixEventPort::UnixEventPort()
+    : timers(kj::heap<TimerSet>()),
+      frozenSteadyTime(currentSteadyTime()) {
   pthread_once(&registerReservedSignalOnce, &registerReservedSignal);
 }
 
-UnixEventPort::~UnixEventPort() {}
+UnixEventPort::~UnixEventPort() noexcept(false) {}
 
 Promise<short> UnixEventPort::onFdEvent(int fd, short eventMask) {
   return newAdaptedPromise<short, PollPromiseAdapter>(*this, fd, eventMask);
@@ -245,6 +289,10 @@ private:
   int pollError = 0;
 };
 
+Promise<void> UnixEventPort::atSteadyTime(TimePoint time) {
+  return newAdaptedPromise<void, TimerPromiseAdapter>(*this, time);
+}
+
 void UnixEventPort::wait() {
   sigset_t newMask;
   sigemptyset(&newMask);
@@ -279,13 +327,33 @@ void UnixEventPort::wait() {
   threadCapture = &capture;
   sigprocmask(SIG_UNBLOCK, &newMask, &origMask);
 
-  pollContext.run(-1);
+  // poll()'s timeout is an `int` count of milliseconds, so truncate to that.
+  // Also, make sure that we aren't within a millisecond of overflowing a `Duration` since that
+  // will break the math below.
+  constexpr Duration MAX_TIMEOUT =
+      min(int(maxValue) * MILLISECONDS, Duration(maxValue) - MILLISECONDS);
+
+  int pollTimeout = -1;
+  auto timer = timers->timers.begin();
+  if (timer != timers->timers.end()) {
+    Duration timeout = (*timer)->time - currentSteadyTime();
+    if (timeout < 0 * SECONDS) {
+      pollTimeout = 0;
+    } else if (timeout < MAX_TIMEOUT) {
+      // Round up to the next millisecond
+      pollTimeout = (timeout + 1 * MILLISECONDS - unit<Duration>()) / MILLISECONDS;
+    } else {
+      pollTimeout = MAX_TIMEOUT / MILLISECONDS;
+    }
+  }
+  pollContext.run(pollTimeout);
 
   sigprocmask(SIG_SETMASK, &origMask, nullptr);
   threadCapture = nullptr;
 
   // Queue events.
   pollContext.processResults();
+  processTimers();
 }
 
 void UnixEventPort::poll() {
@@ -332,6 +400,7 @@ void UnixEventPort::poll() {
     pollContext.run(0);
     pollContext.processResults();
   }
+  processTimers();
 }
 
 void UnixEventPort::gotSignal(const siginfo_t& siginfo) {
@@ -344,6 +413,22 @@ void UnixEventPort::gotSignal(const siginfo_t& siginfo) {
     } else {
       ptr = ptr->next;
     }
+  }
+}
+
+TimePoint UnixEventPort::currentSteadyTime() {
+  return origin<TimePoint>() + std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count() * NANOSECONDS;
+}
+
+void UnixEventPort::processTimers() {
+  frozenSteadyTime = currentSteadyTime();
+  for (;;) {
+    auto front = timers->timers.begin();
+    if (front == timers->timers.end() || (*front)->time > frozenSteadyTime) {
+      break;
+    }
+    (*front)->fulfill();
   }
 }
 

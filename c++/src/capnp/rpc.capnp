@@ -1,25 +1,23 @@
-# Copyright (c) 2013, Kenton Varda <temporal@gmail.com>
-# All rights reserved.
+# Copyright (c) 2013-2014 Sandstorm Development Group, Inc. and contributors
+# Licensed under the MIT License:
 #
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
 #
-# 1. Redistributions of source code must retain the above copyright notice, this
-#    list of conditions and the following disclaimer.
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-#    this list of conditions and the following disclaimer in the documentation
-#    and/or other materials provided with the distribution.
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
 #
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
-# ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
-# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
 
 @0xb312981b2552a250;
 # Recall that Cap'n Proto RPC allows messages to contain references to remote objects that
@@ -111,7 +109,7 @@
 # bother implementing any other vat network protocol -- just use the correct container type and get
 # it for free.
 
-using Cxx = import "c++.capnp";
+using Cxx = import "/capnp/c++.capnp";
 $Cxx.namespace("capnp::rpc");
 
 # ========================================================================================
@@ -420,21 +418,19 @@ struct Finish {
   # Message type sent from the caller to the callee to indicate:
   # 1) The questionId will no longer be used in any messages sent by the callee (no further
   #    pipelined requests).
-  # 2) Any capabilities in the results other than the ones listed below should be implicitly
-  #    released.
-  # 3) If the call has not returned yet, the caller no longer cares about the result.  If nothing
-  #    else cares about the result either (e.g. there are to other outstanding calls pipelined on
+  # 2) If the call has not returned yet, the caller no longer cares about the result.  If nothing
+  #    else cares about the result either (e.g. there are no other outstanding calls pipelined on
   #    the result of this one) then the callee may wish to immediately cancel the operation and
   #    send back a Return message with "canceled" set.  However, implementations are not required
   #    to support premature cancellation -- instead, the implementation may wait until the call
   #    actually completes and send a normal `Return` message.
   #
-  # TODO(someday):  Should we separate (1) and (2)?  It would be possible and useful to notify the
-  #   server that it doesn't need to keep around the response to service pipeline requests even
-  #   though the caller still wants to receive it / hasn't yet finished processing it.  It could
-  #   also be useful to notify the server that it need not marshal the results because the caller
-  #   doesn't want them anyway, even if the caller is still sending pipelined calls, although this
-  #   seems less useful (just saving some bytes on the wire).
+  # TODO(someday): Should we separate (1) and implicitly releasing result capabilities?  It would be
+  #   possible and useful to notify the server that it doesn't need to keep around the response to
+  #   service pipeline requests even though the caller still wants to receive it / hasn't yet
+  #   finished processing it.  It could also be useful to notify the server that it need not marshal
+  #   the results because the caller doesn't want them anyway, even if the caller is still sending
+  #   pipelined calls, although this seems less useful (just saving some bytes on the wire).
 
   questionId @0 :QuestionId;
   # ID of the call whose result is to be released.

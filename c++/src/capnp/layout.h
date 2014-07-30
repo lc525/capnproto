@@ -1,25 +1,23 @@
-// Copyright (c) 2013, Kenton Varda <temporal@gmail.com>
-// All rights reserved.
+// Copyright (c) 2013-2014 Sandstorm Development Group, Inc. and contributors
+// Licensed under the MIT License:
 //
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
 //
-// 1. Redistributions of source code must retain the above copyright notice, this
-//    list of conditions and the following disclaimer.
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-//    this list of conditions and the following disclaimer in the documentation
-//    and/or other materials provided with the distribution.
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
 //
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-// WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
-// ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-// (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-// LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
-// ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
 
 // This file is NOT intended for use by clients, except in generated code.
 //
@@ -36,6 +34,25 @@
 #include "common.h"
 #include "blob.h"
 #include "endian.h"
+
+#if __mips__ && !defined(CAPNP_CANONICALIZE_NAN)
+#define CAPNP_CANONICALIZE_NAN 1
+// Explicitly detect NaNs and canonicalize them to the quiet NaN value as would be returned by
+// __builtin_nan("") on systems implementing the IEEE-754 recommended (but not required) NaN
+// signalling/quiet differentiation (such as x86).  Unfortunately, some architectures -- in
+// particular, MIPS -- represent quiet vs. signalling nans differently than the rest of the world.
+// Canonicalizing them makes output consistent (which is important!), but hurts performance
+// slightly.
+//
+// Note that trying to convert MIPS NaNs to standard NaNs without losing data doesn't work.
+// Signaling vs. quiet is indicated by a bit, with the meaning being the opposite on MIPS vs.
+// everyone else.  It would be great if we could just flip that bit, but we can't, because if the
+// significand is all-zero, then the value is infinity rather than NaN.  This means that on most
+// machines, where the bit indicates quietness, there is one more quiet NaN value than signalling
+// NaN value, whereas on MIPS there is one more sNaN than qNaN, and thus there is no isomorphic
+// mapping that properly preserves quietness.  Instead of doing something hacky, we just give up
+// and blow away NaN payloads, because no one uses them anyway.
+#endif
 
 namespace capnp {
 
@@ -245,6 +262,12 @@ inline Mask<T> mask(T value, Mask<T> mask) {
 
 template <>
 inline uint32_t mask<float>(float value, uint32_t mask) {
+#if CAPNP_CANONICALIZE_NAN
+  if (value != value) {
+    return 0x7fc00000u ^ mask;
+  }
+#endif
+
   uint32_t i;
   static_assert(sizeof(i) == sizeof(value), "float is not 32 bits?");
   memcpy(&i, &value, sizeof(value));
@@ -253,6 +276,12 @@ inline uint32_t mask<float>(float value, uint32_t mask) {
 
 template <>
 inline uint64_t mask<double>(double value, uint64_t mask) {
+#if CAPNP_CANONICALIZE_NAN
+  if (value != value) {
+    return 0x7ff8000000000000ull ^ mask;
+  }
+#endif
+
   uint64_t i;
   static_assert(sizeof(i) == sizeof(value), "double is not 64 bits?");
   memcpy(&i, &value, sizeof(value));
@@ -747,6 +776,8 @@ public:
   Text::Reader asTextReader() const;
   Data::Reader asDataReader() const;
 
+  void truncate(ElementCount size, bool isText);
+
 private:
   static_assert(1 * POINTERS * WORDS_PER_POINTER == 1 * WORDS,
                 "This struct assumes a pointer is one word.");
@@ -850,6 +881,18 @@ template <typename T>
 inline void StructBuilder::setDataField(ElementCount offset, kj::NoInfer<T> value) {
   reinterpret_cast<WireValue<T>*>(data)[offset / ELEMENTS].set(value);
 }
+
+#if CAPNP_CANONICALIZE_NAN
+// Use mask() on floats and doubles to make sure we canonicalize NaNs.
+template <>
+inline void StructBuilder::setDataField<float>(ElementCount offset, float value) {
+  setDataField<uint32_t>(offset, mask<float>(value, 0));
+}
+template <>
+inline void StructBuilder::setDataField<double>(ElementCount offset, double value) {
+  setDataField<uint64_t>(offset, mask<double>(value, 0));
+}
+#endif
 
 template <>
 inline void StructBuilder::setDataField<bool>(ElementCount offset, bool value) {
@@ -969,6 +1012,18 @@ template <typename T>
 inline void ListBuilder::setDataElement(ElementCount index, kj::NoInfer<T> value) {
   reinterpret_cast<WireValue<T>*>(ptr + index * step / BITS_PER_BYTE)->set(value);
 }
+
+#if CAPNP_CANONICALIZE_NAN
+// Use mask() on floats and doubles to make sure we canonicalize NaNs.
+template <>
+inline void ListBuilder::setDataElement<float>(ElementCount index, float value) {
+  setDataElement<uint32_t>(index, mask<float>(value, 0));
+}
+template <>
+inline void ListBuilder::setDataElement<double>(ElementCount index, double value) {
+  setDataElement<uint64_t>(index, mask<double>(value, 0));
+}
+#endif
 
 template <>
 inline void ListBuilder::setDataElement<bool>(ElementCount index, bool value) {

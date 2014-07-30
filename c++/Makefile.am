@@ -33,7 +33,7 @@ clean-local:
 	  cd gtest && $(MAKE) $(AM_MAKEFLAGS) clean; \
 	fi
 
-AM_CXXFLAGS = -I$(srcdir)/src -I$(builddir)/src $(PTHREAD_CFLAGS)
+AM_CXXFLAGS = -I$(srcdir)/src -I$(builddir)/src -DCAPNP_INCLUDE_DIR='"$(includedir)"' $(PTHREAD_CFLAGS)
 
 AM_LDFLAGS = $(PTHREAD_CFLAGS)
 
@@ -88,12 +88,12 @@ maintainer-clean-local:
 
 public_capnpc_inputs =                                         \
   src/capnp/c++.capnp                                          \
-  src/capnp/schema.capnp
+  src/capnp/schema.capnp                                       \
+  src/capnp/rpc.capnp                                          \
+  src/capnp/rpc-twoparty.capnp
 
 capnpc_inputs =                                                \
   $(public_capnpc_inputs)                                      \
-  src/capnp/rpc.capnp                                          \
-  src/capnp/rpc-twoparty.capnp                                 \
   src/capnp/compiler/lexer.capnp                               \
   src/capnp/compiler/grammar.capnp
 
@@ -142,6 +142,7 @@ includekj_HEADERS =                                            \
   src/kj/async-prelude.h                                       \
   src/kj/async.h                                               \
   src/kj/async-inl.h                                           \
+  src/kj/time.h                                                \
   src/kj/async-unix.h                                          \
   src/kj/async-io.h                                            \
   src/kj/main.h
@@ -347,6 +348,7 @@ capnp_test_SOURCES =                                           \
   src/kj/tuple-test.c++                                        \
   src/kj/one-of-test.c++                                       \
   src/kj/function-test.c++                                     \
+  src/kj/io-test.c++                                           \
   src/kj/mutex-test.c++                                        \
   src/kj/threadlocal-test.c++                                  \
   src/kj/threadlocal-pthread-test.c++                          \

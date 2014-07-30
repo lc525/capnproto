@@ -123,6 +123,7 @@ bar @1 :Text = "blah";
 baz @2 :List(Bool) = [ true, false, false, true ];
 qux @3 :Person = (name = "Bob", email = "bob@example.com");
 corge @4 :Void = void;
+grault @5 :Data = 0x"a1 40 33";
 {% endhighlight %}
 
 ### Unions
@@ -360,6 +361,7 @@ tool](capnp-tool.html#evaluating_constants).
 {% highlight capnp %}
 const pi :Float32 = 3.14159;
 const bob :Person = (name = "Bob", email = "bob@example.com");
+const secret :Data = 0x"9f98739c2b53835e 6720a00907abd42f";
 {% endhighlight %}
 
 Additionally, you may refer to a constant inside another value (e.g. another constant, or a default
@@ -581,7 +583,7 @@ A protocol can be changed in the following ways without breaking backwards-compa
   encoding of any existing type.
 * New fields, enumerants, and methods may be added to structs, enums, and interfaces, respectively,
   as long as each new member's number is larger than all previous members.  Similarly, new fields
-  may be addded to existing groups and unions.
+  may be added to existing groups and unions.
 * New parameters may be added to a method.  The new parameters must be added to the end of the
   parameter list and must have default values.
 * Members can be re-arranged in the source code, so long as their numbers stay the same.

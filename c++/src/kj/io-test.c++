@@ -19,46 +19,39 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#include "units.h"
+#include "io.h"
+#include "debug.h"
 #include <gtest/gtest.h>
-#include <iostream>
+#include <unistd.h>
 
 namespace kj {
 namespace {
 
-class Bytes;
-class KiB;
-class MiB;
+TEST(Io, WriteVec) {
+  // Check that writing an array of arrays works even when some of the arrays are empty.  (This
+  // used to not work in some cases.)
 
-typedef Quantity<int, Bytes> ByteCount;
-typedef Quantity<int, KiB> KiBCount;
-typedef Quantity<int, MiB> MiBCount;
+  int fds[2];
+  KJ_SYSCALL(pipe(fds));
 
-constexpr ByteCount BYTE = unit<ByteCount>();
-constexpr KiBCount KIB = unit<KiBCount>();
-constexpr MiBCount MIB = unit<MiBCount>();
+  FdInputStream in((AutoCloseFd(fds[0])));
+  FdOutputStream out((AutoCloseFd(fds[1])));
 
-constexpr UnitRatio<int, Bytes, KiB> BYTES_PER_KIB = 1024 * BYTE / KIB;
-constexpr UnitRatio<int, Bytes, MiB> BYTES_PER_MIB = 1024 * 1024 * BYTE / MIB;
-constexpr auto KIB_PER_MIB = 1024 * KIB / MIB;
+  ArrayPtr<const byte> pieces[5] = {
+    arrayPtr(implicitCast<const byte*>(nullptr), 0),
+    arrayPtr(reinterpret_cast<const byte*>("foo"), 3),
+    arrayPtr(implicitCast<const byte*>(nullptr), 0),
+    arrayPtr(reinterpret_cast<const byte*>("bar"), 3),
+    arrayPtr(implicitCast<const byte*>(nullptr), 0)
+  };
 
-template <typename T, typename U>
-std::ostream& operator<<(std::ostream& os, Quantity<T, U> value) {
-  return os << (value / unit<Quantity<T, U>>());
-}
+  out.write(pieces);
 
-TEST(UnitMeasure, Basics) {
-  KiBCount k = 15 * KIB;
-  EXPECT_EQ(15, k / KIB);
-  EXPECT_EQ(16 * KIB, k + KIB);
+  char buf[7];
+  in.read(buf, 6);
+  buf[6] = '\0';
 
-  k += KIB;
-  k *= 2048;
-
-  EXPECT_EQ(32 * MIB, k / KIB_PER_MIB);
-
-  EXPECT_TRUE(2 * KIB < 4 * KIB);
-  EXPECT_FALSE(8 * KIB < 4 * KIB);
+  EXPECT_STREQ("foobar", buf);
 }
 
 }  // namespace
