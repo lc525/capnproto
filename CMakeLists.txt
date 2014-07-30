@@ -2,5 +2,5 @@
 # who want to integrate capnproto using ExternalProject_Add.
 # For sample configuration, see https://gist.github.com/isn-/7993036
 cmake_minimum_required(VERSION 2.8)
-
+enable_testing()
 add_subdirectory(c++)
